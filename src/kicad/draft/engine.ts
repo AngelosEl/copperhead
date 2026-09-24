@@ -1,5 +1,6 @@
 import type { Bounds } from '../sexp.js';
 import { knum, CAPTION_SIZE, type PlacementModel, type EmitSymbol, type EmitLabel, type LabelShape } from '../emit.js';
+import { strokeTextExtent } from '../strokefont.js';
 import { powerSymbolSource, pwrFlagSource, type ResolvedSymbol, type DraftPin } from './symsource.js';
 import type { SchematicIntent, IntentNet, IntentPart, ValidatedIntent } from './ir.js';
 
@@ -83,6 +84,12 @@ const trace = (msg: string): void => {
 /** `labelTextBox` at the reserve advance: what the text takes on paper. */
 const labelReserveBox = (name: string, x: number, y: number, rot: number, kind: EmitLabel['kind'] = 'local'): Bounds =>
   labelBoxAt(name, x, y, rot, kind, TEXT_RESERVE);
+/** A group caption as `emit.ts` writes it (bold, left-top, 2 mm in from the
+ * box corner) and the checker measures it: to the edge of its ink. */
+const captionBox = (r: { name: string; x1: number; y1: number }): Bounds => {
+  const ink = strokeTextExtent(r.name, CAPTION_SIZE, 'left');
+  return { minX: r.x1 + 2 + ink.minX, minY: r.y1 + 2, maxX: r.x1 + 2 + ink.maxX, maxY: r.y1 + 2 + CAPTION_SIZE };
+};
 /**
  * Along-axis length a global label's flag adds beyond its text: the margin
  * either side of the text plus the pointed tip. Measured from eeschema's own
@@ -4758,6 +4765,10 @@ function draftOnce(
         r.y1 = Math.min(r.y1, b.minY - BOX_PAD * U);
         r.y2 = Math.max(r.y2, b.maxY + BOX_PAD * U);
       }
+      // and its caption, to the edge of its ink: the checker gates on a
+      // caption leaving its box, so a long name over a narrow group widens
+      // the group (#307). Width only: the caption band above is its height.
+      r.x2 = Math.max(r.x2, captionBox(r).maxX + BOX_PAD * U);
       // The caption is a band across the top of the box, not a corner the
       // parts may rise into: nothing drawn starts above the caption's
       // bottom plus a unit of air, whatever its column (a rail name beside
@@ -4912,7 +4923,7 @@ function draftOnce(
       const left0 = Math.min(...groupRects.map((r) => r.x1));
       const top0 = Math.min(...groupRects.map((r) => r.y1));
       // what each box was before the alignment above shared its edges
-      const ownSize = new Map(groupRects.map((r, i) => [r.name, { w: Math.max(...(boxesOf.get(r.name) ?? []).map((b) => b.maxX + BOX_PAD * U), rectsBeforeText[i]!.x2) - r.x1, h: Math.max(...(boxesOf.get(r.name) ?? []).map((b) => b.maxY + BOX_PAD * U), rectsBeforeText[i]!.y2) - r.y1 }]));
+      const ownSize = new Map(groupRects.map((r, i) => [r.name, { w: Math.max(...(boxesOf.get(r.name) ?? []).map((b) => b.maxX + BOX_PAD * U), captionBox(r).maxX + BOX_PAD * U, rectsBeforeText[i]!.x2) - r.x1, h: Math.max(...(boxesOf.get(r.name) ?? []).map((b) => b.maxY + BOX_PAD * U), rectsBeforeText[i]!.y2) - r.y1 }]));
       if (columnar) {
         let colLeft = left0;
         for (const members of lines) {
@@ -5142,7 +5153,7 @@ function draftOnce(
     // group captions: left-top justified at CAPTION_SIZE from the box
     // corner, the way emit.ts writes them and the checker measures them; a
     // long caption on a narrow group can outrun the box's right edge
-    ...groupRects.map((r): Bounds => ({ minX: r.x1 + 2, minY: r.y1 + 2, maxX: r.x1 + 2 + Math.max(1, r.name.length) * LABEL_ADVANCE * CAPTION_SIZE, maxY: r.y1 + 2 + CAPTION_SIZE })),
+    ...groupRects.map(captionBox),
   ];
   const fullMinX = Math.min(minX, ...textBoxes.map((b) => b.minX));
   const fullMaxX = Math.max(minX + contentW, ...textBoxes.map((b) => b.maxX));

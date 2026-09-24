@@ -8,6 +8,8 @@ import { validateIntent, type SchematicIntent } from '../src/kicad/draft/ir.js';
 import { draftSchematicPlacement } from '../src/kicad/draft/engine.js';
 import { draftSchematic } from '../src/kicad/draft/draft.js';
 import { checkLegibility } from '../src/kicad/legibility.js';
+import { strokeTextExtent } from '../src/kicad/strokefont.js';
+import { CAPTION_SIZE } from '../src/kicad/emit.js';
 
 /**
  * Sheet-level layout passes: shelf-wrap, stacked-pin collapse, power-value
@@ -729,4 +731,41 @@ describe('label nudging keeps a stub label attached and clear', () => {
     expect(seen).toBeGreaterThan(0);
     expect(nudgedOnce, 'no seeded intent produced a nudge').toBe(true);
   }, 120000);
+});
+
+describe('a group box contains its caption (#307)', () => {
+  it('widens a one-part group under a long caption so the drafted sheet has no caption overflow', async () => {
+    const LONG = 'Mechanical connector and mounting holes';
+    const intent: SchematicIntent = {
+      version: 1,
+      parts: [
+        { ref: 'R1', libId: 'Device:R', value: '10k', group: LONG },
+        { ref: 'R2', libId: 'Device:R', value: '10k', group: 'IO' },
+      ],
+      nets: [{ name: 'SIG', pins: ['R1.1', 'R2.1'] }, { name: 'OUT', pins: ['R1.2', 'R2.2'] }],
+      noConnect: [],
+    };
+    const { model } = await place(intent);
+    const rect = model.rectangles.find((r) => r.name === LONG)!;
+    const cap = model.captions.find((c) => c.name === LONG)!;
+    const ink = strokeTextExtent(cap.text, CAPTION_SIZE, 'left');
+    // a lone resistor cell is ~10 mm wide; the caption's ink is ~130 mm
+    expect(cap.x + ink.maxX).toBeLessThanOrEqual(rect.x2);
+    expect(cap.x + ink.minX).toBeGreaterThanOrEqual(rect.x1);
+
+    const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-caption-'));
+    try {
+      await mkdir(path.join(repo, 'docs'), { recursive: true });
+      await writeFile(path.join(repo, 'docs', 'SUBSYSTEMS.md'), `# Subsystems\n\n## ${LONG}\n\nConnector.\n\n## IO\n\nIO.\n`, 'utf8');
+      await writeFile(path.join(repo, 'schematic.intent.json'), JSON.stringify(intent, null, 2), 'utf8');
+      const res = await draftSchematic({ repoRoot: repo, schematic: 'board.kicad_sch', docsDir: 'docs', symbolDirs: [SYMLIB] });
+      expect(res.ok, res.ok ? '' : res.message).toBe(true);
+      if (!res.ok) return;
+      const leg = await checkLegibility(res.schematicPath, { docsDir: path.join(repo, 'docs') });
+      expect(leg.findings.filter((f) => /past its group rectangle/.test(f.detail))).toEqual([]);
+      expect(leg.findings.filter((f) => f.severity === 'error')).toEqual([]);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  }, 60000);
 });

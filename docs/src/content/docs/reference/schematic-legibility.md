@@ -38,7 +38,7 @@ Each finding carries a stable kind identifier. Error-severity families gate the 
 | `wire-through-symbol` | error | A wire crossing a symbol body without terminating on one of its pins. |
 | `out-of-frame` | error | Content outside the usable frame area or over the title block. |
 | `ungrouped-symbol` | error | A non-power symbol inside no group rectangle. |
-| `unlabeled-group` | error | A group with no caption, or a caption naming nothing in SUBSYSTEMS.md or BOM.md. |
+| `unlabeled-group` | error | A group with no caption, a caption naming nothing in SUBSYSTEMS.md or BOM.md, or a caption whose drawn text runs past its group rectangle. |
 | `group-overlap` | error | Two group rectangles intersecting without one fully containing the other. |
 | `empty-title-block` | error | An empty title, revision, or date field. |
 | `label-orientation` | advisory | A label rotated 90 or 270 degrees where a horizontal draw would collide with nothing. A global flag continuing a vertical wire is exempt: the wire orients it. |
@@ -48,7 +48,7 @@ Each finding carries a stable kind identifier. Error-severity families gate the 
 
 The split is deliberate: every gating family has an unambiguous answer and a single resolving move, while the advisory families rest on thresholds, and gating on a threshold invites the repair loop to thrash against a number instead of fixing a defect.
 
-A horizontal local label is measured standing on its anchor, one text height above the wire it names and nothing below it, the way eeschema draws it; a label on a horizontal wire is therefore not text on a wire. A global or hierarchical label is measured as the flag eeschema draws: two text heights tall, centred on the anchor line, running away from the anchor in its angle's direction, with the outline's margins and tip added to the text length. What the checker deliberately excludes: pin name and pin number text participate in no collision test (they sit inside IC outlines by design), a label never collides with the wire it is attached to, and text extents are estimated at a fixed 0.6 × font height per character, below the stroke font's average advance, so the checker misses marginal collisions rather than inventing them.
+A horizontal local label is measured standing on its anchor, one text height above the wire it names and nothing below it, the way eeschema draws it; a label on a horizontal wire is therefore not text on a wire. A global or hierarchical label is measured as the flag eeschema draws: two text heights tall, centred on the anchor line, running away from the anchor in its angle's direction, with the outline's margins and tip added to the text length. What the checker deliberately excludes: pin name and pin number text participate in no collision test (they sit inside IC outlines by design), a label never collides with the wire it is attached to, and text extents are estimated at a fixed 0.6 × font height per character, below the stroke font's average advance, so the checker misses marginal collisions rather than inventing them. Group captions are the exception: the containment check needs the caption's real extent, so a caption is measured glyph by glyph from KiCad's stroke-font metrics, to the edge of its ink. The drafting engine sizes each group box with the same measurement, so its drafts contain their captions by construction.
 
 ## Where the checks bind
 

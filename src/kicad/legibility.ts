@@ -13,6 +13,7 @@ import {
   type WireSeg,
   type PlacedSymbolGeom,
 } from './sexp.js';
+import { strokeTextExtent } from './strokefont.js';
 import type { LegibilityUserConfig } from '../config.js';
 
 /**
@@ -76,10 +77,7 @@ export const DEFAULT_THRESHOLDS: LegibilityThresholds = {
 /** File-precision noise must never flip a finding (design C7). */
 const TOL = 0.01;
 /** Stroke-font advance as a fraction of height, tuned BELOW the true average (design C3). */
-/** Stroke-font advance as a fraction of height. KiCad stroke font advances at ~0.76-0.78 (closes #307). */
 const TEXT_ADVANCE = 0.6;
-/** Group caption advance as a fraction of height. KiCad stroke font advances at ~0.76-0.78 (#307). */
-const CAPTION_ADVANCE = 0.78;
 /** Drawing-frame inset from the paper edge. */
 const FRAME_BORDER = 10;
 /** Reserved title-block rectangle in the bottom-right of the frame, clamped on small pages. */
@@ -194,10 +192,8 @@ function textBounds(t: {
   height: number;
   justifyH?: 'left' | 'right' | null;
   justifyV?: 'top' | 'bottom' | null;
-  isCaption?: boolean;
 }): Bounds {
-  const advance = t.isCaption ? CAPTION_ADVANCE : TEXT_ADVANCE;
-  const w = Math.max(1, t.text.length) * advance * t.height;
+  const w = Math.max(1, t.text.length) * TEXT_ADVANCE * t.height;
   const h = t.height;
   const vertical = Math.abs(t.rot % 180) === 90;
   const [bw, bh] = vertical ? [h, w] : [w, h];
@@ -211,6 +207,25 @@ function textBounds(t: {
   const minX = jh === 'left' ? t.x : jh === 'right' ? t.x - bw : t.x - bw / 2;
   const minY = jv === 'top' ? t.y : jv === 'bottom' ? t.y - bh : t.y - bh / 2;
   return { minX, minY, maxX: minX + bw, maxY: minY + bh };
+}
+
+/**
+ * A group caption's box, measured to CONTAIN its ink (strokefont.ts) where
+ * `textBounds` is short on purpose (design C3): the caption-overflow check
+ * asks whether the caption stays inside its group, and a short box let a
+ * caption drawn 22 mm past its group's edge pass as clean (#307). Vertical
+ * placement is `textBounds`'s; a rotated caption keeps its centred box at the
+ * contained width.
+ */
+function captionBounds(t: TextItem): Bounds {
+  const e = strokeTextExtent(t.text, t.height, t.justifyH ?? 'center');
+  const box = textBounds(t);
+  if (Math.abs(t.rot % 180) === 90) {
+    const w = e.maxX - e.minX;
+    const cy = (box.minY + box.maxY) / 2;
+    return { minX: box.minX, maxX: box.maxX, minY: cy - w / 2, maxY: cy + w / 2 };
+  }
+  return { minX: t.x + e.minX, maxX: t.x + e.maxX, minY: box.minY, maxY: box.maxY };
 }
 
 /**
@@ -458,10 +473,7 @@ function checkSheet(
     }
   }
   for (const t of sheet.texts) {
-    if (!t.hidden && t.text) {
-      const isCaption = captionTexts.has(t);
-      visibleTexts.push({ owner: `text "${t.text}"`, ownerRef: null, t, box: textBounds({ ...t, isCaption }) });
-    }
+    if (!t.hidden && t.text) visibleTexts.push({ owner: `text "${t.text}"`, ownerRef: null, t, box: captionTexts.has(t) ? captionBounds(t) : textBounds(t) });
   }
   const labelBoxes = sheet.labels.map((l) => ({
     l,
@@ -563,9 +575,16 @@ function checkSheet(
       add('unlabeled-group', S, center(g.bounds), [g.caption], `group caption "${g.caption}" names nothing in SUBSYSTEMS.md or BOM.md; use a documented name (e.g. "${nearest}")`);
     }
     if (g.capItem) {
-      const cBox = textBounds({ ...g.capItem, isCaption: true });
-      if (cBox.maxX > g.bounds.maxX + TOL) {
-        add('unlabeled-group', S, center(cBox), [g.caption || g.label], `group caption "${g.caption}" overflows its group rectangle by ${fmt(cBox.maxX - g.bounds.maxX)}mm; widen the group rectangle or shorten the caption (#307)`);
+      const cBox = captionBounds(g.capItem);
+      if (!boundsContain(g.bounds, cBox)) {
+        const over: [string, number][] = [
+          ['right', cBox.maxX - g.bounds.maxX],
+          ['left', g.bounds.minX - cBox.minX],
+          ['top', g.bounds.minY - cBox.minY],
+          ['bottom', cBox.maxY - g.bounds.maxY],
+        ];
+        const [edge, by] = over.reduce((a, b) => (b[1] > a[1] ? b : a));
+        add('unlabeled-group', S, center(cBox), [g.label], `group caption "${g.caption}" runs ${fmt(by)}mm past its group rectangle's ${edge} edge; widen the group rectangle or shorten the caption`);
       }
     }
   }

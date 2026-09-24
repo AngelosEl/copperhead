@@ -340,20 +340,76 @@ describe('KiCad 10 hidden fields', () => {
     }
   });
 
-  it('flags group caption overflow when caption extends past group rectangle (#307)', async () => {
-    // Group box width 30mm (from 20 to 50). Caption "B. Input bypass and filtering" (30 chars)
-    // with height 2mm and CAPTION_ADVANCE 0.78 reaches 30 * 0.78 * 2 = 46.8mm > 30mm.
+});
+
+describe('group captions are measured to their ink (#307)', () => {
+  it('flags a group caption whose ink runs past its group rectangle (#307)', async () => {
+    // Group box 20..50; a 3.5 mm bold caption anchored left-top at 22. "B. Input bypass"
+    // (15 chars) draws to ~62 mm in KiCad: the old 0.6 box ended at 53.5, and a
+    // length-only 0.78 box at 62.95 still missed the ink in narrower cases.
     const body = `
       (rectangle (start 20 20) (end 50 50) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
-      (text "B. Input bypass and filtering" (at 22 22 0) (effects (font (size 2 2)) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      (text "B. Input bypass" (at 22 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
       ${symR('R1', 30, 35)}
     `;
     const { file, cleanup } = await inTemp(sch(body));
     try {
       const report = await checkLegibility(file, { docsDir: DOCS });
-            const overflowFinding = report.findings.find((f) => f.kind === 'unlabeled-group' && f.detail.includes('overflows its group rectangle'));
-      expect(overflowFinding).toBeDefined();
-      expect(overflowFinding?.detail).toContain('overflows its group rectangle');
+      const f = report.findings.find((x) => x.kind === 'unlabeled-group' && /past its group rectangle/.test(x.detail));
+      expect(f?.detail).toMatch(/"B\. Input bypass" runs [\d.]+mm past its group rectangle's right edge/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('measures captions to their ink, not an average advance: a wide-glyph caption that 0.78 per char would pass is flagged', async () => {
+    // "WWWWMMMM" is 8 chars: 8 * 0.78 * 3.5 = 21.84 mm from x=22 ends at 43.84, inside the
+    // 20..45 box. KiCad draws W and M at 1.14 and 1.14 of the height: the ink reaches ~54 mm.
+    const body = `
+      (rectangle (start 20 20) (end 45 50) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
+      (text "WWWWMMMM" (at 22 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      ${symR('R1', 30, 35)}
+    `;
+    const { file, cleanup } = await inTemp(sch(body));
+    try {
+      const report = await checkLegibility(file, {});
+      expect(report.findings.some((x) => /"WWWWMMMM" runs [\d.]+mm past its group rectangle's right edge/.test(x.detail))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('a caption that fits its group, narrow glyphs included, is not an overflow', async () => {
+    // "illi.illi" draws ~17 mm of ink at 3.5 mm, inside the 21 mm the 60..83 box leaves from
+    // its anchor at 62; a flat 9 * 0.78 * 3.5 = 24.6 mm would call it an overflow
+    const body = `
+      (rectangle (start 20 20) (end 50 50) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
+      (text "Power" (at 22 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      (rectangle (start 60 20) (end 83 50) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r002"))
+      (text "illi.illi" (at 62 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t002"))
+      ${symR('R1', 30, 35)}
+      ${symR('R2', 70, 35)}
+    `;
+    const { file, cleanup } = await inTemp(sch(body));
+    try {
+      const report = await checkLegibility(file, {});
+      expect(report.findings.filter((x) => /past its group rectangle/.test(x.detail))).toEqual([]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('a centred caption that spills out of the left edge is an overflow too', async () => {
+    // no (justify left): KiCad centres the caption on its anchor at x=24, so half of it hangs left of x=20
+    const body = `
+      (rectangle (start 20 20) (end 80 50) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
+      (text "Power input" (at 24 22 0) (effects (font (size 3.5 3.5) bold) (justify top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      ${symR('R1', 50, 35)}
+    `;
+    const { file, cleanup } = await inTemp(sch(body));
+    try {
+      const report = await checkLegibility(file, {});
+      expect(report.findings.some((x) => /"Power input" runs [\d.]+mm past its group rectangle's left edge/.test(x.detail))).toBe(true);
     } finally {
       await cleanup();
     }
