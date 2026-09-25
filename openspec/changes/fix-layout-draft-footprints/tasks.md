@@ -78,3 +78,15 @@
 - [x] 11.8 Scaffold `.kicad_dru` holds board vias to a 0.3 mm drill
 - [x] 11.9 Test fixtures use real footprint ids; `check`'s DRC keys updated; DRC tests run against a seeded KiCad config, not the machine's
 - [x] 11.10 SPEC.md AC-15.30/31/36–44 and the populate bullet; delta specs; design.md
+
+## 12. Follow-up review fixes (PR 319, second pass)
+
+- [x] 12.1 `joinsNets`: only `shorting_items` joins nets; a clearance between a footprint's own pads stays intrinsic across nets (stock USB-C receptacles)
+- [x] 12.2 Populate and `moveFootprint` move and turn a footprint's zones, at 1 nm resolution; test: three stock ESP32 modules off-origin, and moved at 90 and 45 degrees
+- [x] 12.3 `unroutedGuard` skips the comparison when the starting board does not load
+- [x] 12.4 A failed layout-draft stage restores the board an attempt committed, when one did; test with a committing attempt
+- [x] 12.5 Library tables, path variables, and the stock-directory default follow the running `kicad-cli`'s major version; library-table paths are normalized
+- [x] 12.6 `.kicad_dru` is a managed path; layout-draft completion requires a passing DRC; the Stage 5 prompt and the missing-library hint say only what is true
+- [x] 12.7 An outline populate cannot grow must hold every packed part inside its real shape (L-shapes, cutouts)
+- [x] 12.8 Tests: a seeded KiCad config for the pipeline tests (`seededKicadConfig`), platform pinned in the path-variable tests, a loop-level `preTouched` test
+- [x] 12.9 SPEC.md AC-15.30/36/38/39/41/42/43, the populate bullet, delta specs, design D2/D4/D6/D8

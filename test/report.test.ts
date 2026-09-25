@@ -86,17 +86,19 @@ describe('findings inside one library footprint (#314)', () => {
     expect(track.intrinsic).toEqual([]);
   });
 
-  it('never excuse two nets meeting inside one footprint: a short there is an electrical fault', () => {
+  it('never excuse a short inside one footprint: two nets meeting is an electrical fault', () => {
     // two schematic nets wired onto coincident pads of one stock connector
     const short = normalizeReport({ violations: [v('shorting_items', 'Pad A4 [VCC] of J1 on F.Cu', 'Pad B9 [GND] of J1 on F.Cu')] }, 'drc');
     expect(short.ok).toBe(false);
     expect(short.violations.map((x) => x.type)).toEqual(['shorting_items']);
     expect(short.intrinsic).toEqual([]);
-    const clearance = normalizeReport({ violations: [v('clearance', 'Pad 1 [VCC] of U1 on F.Cu', 'Pad 2 [GND] of U1 on F.Cu')] }, 'drc');
-    expect(clearance.ok).toBe(false);
-    // one named net against an unconnected pad is still the library's own geometry
-    const lone = normalizeReport({ violations: [v('clearance', 'Pad 1 [VCC] of U1 on F.Cu', 'Pad 2 [<no net>] of U1 on F.Cu')] }, 'drc');
-    expect(lone.ok).toBe(true);
+  });
+
+  it("excuse a clearance between a footprint's own pads even across nets: that is the library's geometry", () => {
+    // a stock USB-C receptacle's DP and DM pads sit closer than the board rule
+    const clearance = normalizeReport({ violations: [v('clearance', 'Pad B6 [DP] of J1 on F.Cu', 'Pad B7 [DM] of J1 on F.Cu')] }, 'drc');
+    expect(clearance.ok).toBe(true);
+    expect(clearance.intrinsic?.map((x) => x.type)).toEqual(['clearance']);
   });
 
   it('never excuse a footprint KiCad cannot check against its library', () => {

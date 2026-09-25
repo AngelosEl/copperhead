@@ -31,7 +31,13 @@ export async function unroutedGuard(ctx: RunContext, boardPath: string, report: 
   if (typeof ctx.boardAtStart !== 'string' || report.unrouted === undefined) return report;
   if (ctx.unroutedBaseline === undefined) {
     const now = await readFile(boardPath, 'utf8').catch(() => null);
-    ctx.unroutedBaseline = now === ctx.boardAtStart ? report.unrouted : await unroutedCount(ctx.boardAtStart);
+    try {
+      ctx.unroutedBaseline = now === ctx.boardAtStart ? report.unrouted : await unroutedCount(ctx.boardAtStart);
+    } catch {
+      // the run started from a board KiCad could not load (a run that repairs
+      // it, say): there is no count to hold it to, and the DRC itself still gates
+      ctx.unroutedBaseline = Infinity;
+    }
   }
   const baseline = ctx.unroutedBaseline;
   if (report.unrouted <= baseline) return report;

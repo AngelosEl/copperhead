@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { execa } from 'execa';
 import { bootstrapKicadProject } from '../src/kicad/bootstrap.js';
@@ -10,6 +10,7 @@ import { exportNetlist, resolveKicadCli } from '../src/kicad/cli.js';
 import { expandUri, libTableRows } from '../src/kicad/libtable.js';
 import { kicadLoadError, runDrc } from '../src/kicad/cli.js';
 import { unroutedGuard } from '../src/capabilities/handlers.js';
+import { seededKicadConfig } from './helpers.js';
 import { FootprintResolver, footprintSearchDirs, formatMissingFootprints, missingFootprints } from '../src/kicad/footprints.js';
 import {
   boardFootprints,
@@ -23,7 +24,8 @@ import {
   populateBoard,
 } from '../src/kicad/populate.js';
 import { SymbolSource } from '../src/kicad/draft/symsource.js';
-import { STAGES } from '../src/commands/create.js';
+import { isManagedPath, STAGES } from '../src/commands/create.js';
+import { loadConfig } from '../src/config.js';
 import { bomFootprintRows } from '../src/memory/bom-table.js';
 import { normalizeReport } from '../src/kicad/report.js';
 import { catalog } from '../src/capabilities/index.js';
@@ -56,17 +58,7 @@ const seeded = (): NodeJS.ProcessEnv => ({ ...process.env, KICAD_CONFIG_HOME: se
 beforeAll(async () => {
   stock = (await footprintSearchDirs())[0]!;
   emptyConfig = await mkdtemp(path.join(tmpdir(), 'copperhead-kicadcfg-'));
-  seededConfig = await mkdtemp(path.join(tmpdir(), 'copperhead-kicadcfg-'));
-  const version = /(\d+\.\d+)/.exec((await execa(resolveKicadCli(), ['--version'])).stdout)![1]!;
-  const libs = (await readdir(stock)).filter((e) => e.endsWith('.pretty'));
-  await mkdir(path.join(seededConfig, version), { recursive: true });
-  await writeFile(
-    path.join(seededConfig, version, 'fp-lib-table'),
-    `(fp_lib_table\n\t(version 7)\n${libs
-      .map((e) => `\t(lib (name "${e.slice(0, -'.pretty'.length)}")(type "KiCad")(uri "${path.join(stock, e).split(path.sep).join('/')}")(options "")(descr ""))`)
-      .join('\n')}\n)\n`,
-    'utf8',
-  );
+  seededConfig = (await seededKicadConfig(stock)).dir;
 });
 afterAll(async () => {
   await rm(emptyConfig, { recursive: true, force: true });
@@ -170,9 +162,55 @@ describe('KiCad path variables in library tables (AC-15.30)', () => {
       );
       await writeFile(path.join(cfg, 'kicad_common.json'), JSON.stringify({ environment: { vars: { MY_PARTS: path.join(dir, 'vendor') } } }), 'utf8');
       const env = { HOME: dir, KICAD_CONFIG_HOME: path.join(dir, 'cfg'), XDG_DATA_HOME: data };
-      const { rows } = await libTableRows('fp', { projectDir: dir, env });
+      const { rows } = await libTableRows('fp', { projectDir: dir, env, platform: 'linux', kicadMajor: 10 });
       expect(rows.get('PCM_Espressif')?.uri).toBe(path.join(data, 'kicad', '10.0', '3rdparty', 'footprints', 'PCM_Espressif.pretty'));
       expect(rows.get('Mine')?.uri).toBe(path.join(dir, 'vendor', 'Mine.pretty'));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the running KiCad version picks the config (AC-15.30)', () => {
+  it("reads only the running KiCad's config and variables, not the newest install's", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'copperhead-versions-'));
+    try {
+      const data = path.join(dir, 'data');
+      for (const v of ['9.0', '10.0']) {
+        const major = v.split('.')[0];
+        await mkdir(path.join(dir, 'cfg', v), { recursive: true });
+        await mkdir(path.join(data, 'kicad', v, '3rdparty', `PCM_V${major}.pretty`), { recursive: true });
+        await writeFile(
+          path.join(dir, 'cfg', v, 'fp-lib-table'),
+          `(fp_lib_table\n\t(version 7)\n\t(lib (name "V${major}")(type "KiCad")(uri "\${KICAD${major}_3RD_PARTY}/PCM_V${major}.pretty")(options "")(descr ""))\n)\n`,
+          'utf8',
+        );
+      }
+      const env = { HOME: dir, KICAD_CONFIG_HOME: path.join(dir, 'cfg'), XDG_DATA_HOME: data };
+      const nine = await libTableRows('fp', { projectDir: dir, env, platform: 'linux', kicadMajor: 9 });
+      expect([...nine.rows.keys()]).toEqual(['V9']);
+      expect(nine.rows.get('V9')?.uri).toBe(path.join(data, 'kicad', '9.0', '3rdparty', 'PCM_V9.pretty'));
+      expect(nine.searched).toEqual(['global fp-lib-table (KiCad 9.0)']);
+      const ten = await libTableRows('fp', { projectDir: dir, env, platform: 'linux', kicadMajor: 10 });
+      expect([...ten.rows.keys()]).toEqual(['V10']);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fills in only the running KiCad's stock-footprint variable", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'copperhead-versions-'));
+    try {
+      await writeFile(
+        path.join(dir, 'fp-lib-table'),
+        '(fp_lib_table\n\t(version 7)\n' +
+          '\t(lib (name "Nine")(type "KiCad")(uri "${KICAD9_FOOTPRINT_DIR}/Resistor_SMD.pretty")(options "")(descr ""))\n' +
+          '\t(lib (name "Ten")(type "KiCad")(uri "${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty")(options "")(descr ""))\n)\n',
+        'utf8',
+      );
+      const r = await FootprintResolver.create({ projectDir: dir, env: hermetic(), global: false, stockDirs: [stock], kicadMajor: 10 });
+      expect(await r.resolve('Ten:R_0603_1608Metric')).toMatchObject({ ok: true });
+      expect(await r.resolve('Nine:R_0603_1608Metric')).toMatchObject({ ok: false, why: 'no-library' });
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -375,6 +413,13 @@ describe('populateBoard against kicad-cli (AC-15.36, AC-15.37)', () => {
 
 describe('layout-draft completion compares the board with the schematic (AC-15.38)', () => {
   const layoutDraft = STAGES.find((s) => s.name === 'layout-draft')!;
+  // completion runs kicad-cli DRC, which resolves stock footprints through a global table
+  beforeEach(() => {
+    vi.stubEnv('KICAD_CONFIG_HOME', seededConfig);
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
   const withLayoutDoc = async (repo: string): Promise<void> =>
     writeFile(path.join(repo, 'docs', 'LAYOUT.md'), '# Layout\n\n## Draft quality\n\nGrid placement; route by hand.\n', 'utf8');
 
@@ -404,6 +449,24 @@ describe('layout-draft completion compares the board with the schematic (AC-15.3
         'utf8',
       );
       expect(await layoutDraft.isComplete(repo, 'docs/')).toBe(false); // footprint changed
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('a board that fails DRC does not complete it, even with every part and the LAYOUT.md section', async () => {
+    const { repo, cleanup } = await draftedProject();
+    try {
+      await withLayoutDoc(repo);
+      await populateBoard({ repoRoot: repo, schematic: SCH, board: PCB, env: hermetic() });
+      expect(await layoutDraft.isComplete(repo, 'docs/')).toBe(true);
+      const board = path.join(repo, PCB);
+      const populated = await readFile(board, 'utf8');
+      // C1 dropped on top of R1: overlapping courtyards and shorted pads
+      const r1 = /\(property "Reference" "R1"/.exec(populated)!.index;
+      const at = /\(at ([-\d.]+) ([-\d.]+)\)/.exec(populated.slice(populated.lastIndexOf('(footprint ', r1)))!;
+      await writeFile(board, moveFootprint(populated, 'C1', Number(at[1]), Number(at[2])), 'utf8');
+      expect(await layoutDraft.isComplete(repo, 'docs/')).toBe(false);
     } finally {
       await cleanup();
     }
@@ -697,15 +760,56 @@ describe('populate edge cases (#314)', () => {
     }
   });
 
-  /** Replace the scaffold's gr_rect outline with four Edge.Cuts lines. */
-  const lineOutline = (text: string, x1: number, y1: number, x2: number, y2: number): string => {
+  it("moves a footprint's zones with it: ESP32 modules match their library wherever they are placed or turned", async () => {
+    const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-zones-'));
+    try {
+      await mkdir(path.join(repo, '.copperhead'), { recursive: true });
+      await bootstrapKicadProject(repo, '# Demo board');
+      const board = path.join(repo, PCB);
+      const scaffold = await readFile(board, 'utf8');
+      const mismatches = async (text: string): Promise<number> => {
+        await writeFile(board, text, 'utf8');
+        const out = path.join(repo, 'drc.json');
+        await execa(resolveKicadCli(), ['pcb', 'drc', '--format', 'json', '--output', out, board], { reject: false, env: seeded() });
+        const raw = JSON.parse(await readFile(out, 'utf8')) as { violations: { type: string }[] };
+        return raw.violations.filter((v) => v.type === 'lib_footprint_mismatch').length;
+      };
+      for (const id of ['RF_Module:ESP32-WROOM-32', 'RF_Module:ESP32-C3-WROOM-02', 'RF_Module:ESP32-S3-WROOM-1']) {
+        const [lib, name] = id.split(':') as [string, string];
+        const mod = await readFile(path.join(stock, `${lib}.pretty`, `${name}.kicad_mod`), 'utf8');
+        expect(mod).toContain('(zone');
+        const fp = instantiateFootprint(mod, {
+          fpId: id,
+          ref: 'U1',
+          value: name,
+          uuid: '00000000-0000-0000-0000-000000000001',
+          at: { x: 120, y: 120 },
+          path: '/x',
+          sheetname: '/',
+          sheetfile: 'demo-board.kicad_sch',
+          padNet: () => undefined,
+        });
+        const placed = scaffold.slice(0, scaffold.lastIndexOf(')')) + fp + '\n)\n';
+        expect(await mismatches(placed), `${id} placed off-origin`).toBe(0);
+        for (const rot of [90, 45]) {
+          expect(await mismatches(moveFootprint(placed, 'U1', 150, 140, rot)), `${id} moved and turned ${rot}`).toBe(0);
+        }
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  /** Replace the scaffold's gr_rect outline with Edge.Cuts lines around `c`, plus any extra items. */
+  const polyOutline = (text: string, c: number[][], extra = ''): string => {
     const start = text.indexOf('(gr_rect');
     const end = text.indexOf('\n\t)', start) + 3;
     const seg = (a: number[], b: number[], i: number): string =>
-      `(gr_line (start ${a[0]} ${a[1]}) (end ${b[0]} ${b[1]}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "00000000-0000-0000-0000-00000000000${i}"))`;
-    const c = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]];
-    return text.slice(0, start) + c.map((p, i) => seg(p, c[(i + 1) % 4]!, i)).join('\n\t') + text.slice(end);
+      `(gr_line (start ${a[0]} ${a[1]}) (end ${b[0]} ${b[1]}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "00000000-0000-0000-0000-0000000000${String(i).padStart(2, '0')}"))`;
+    return text.slice(0, start) + c.map((p, i) => seg(p, c[(i + 1) % c.length]!, i)).join('\n\t') + extra + text.slice(end);
   };
+  const lineOutline = (text: string, x1: number, y1: number, x2: number, y2: number): string =>
+    polyOutline(text, [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]);
 
   it('packs inside an outline it cannot grow, or stops when the parts do not fit', async () => {
     const { repo, cleanup } = await draftedProject();
@@ -732,12 +836,34 @@ describe('populate edge cases (#314)', () => {
     }
   });
 
-  it('the scaffold holds board vias to a 0.3 mm drill while footprint holes may be 0.2 mm', async () => {
+  it('stops instead of packing parts into a corner an L-shaped outline leaves off the board, or onto a cutout', async () => {
+    const { repo, cleanup } = await draftedProject();
+    try {
+      const board = path.join(repo, PCB);
+      const scaffold = await readFile(board, 'utf8');
+      // the top band is only 20 mm wide; the box around the L is 60 mm wide
+      await writeFile(board, polyOutline(scaffold, [[50, 60], [70, 60], [70, 90], [110, 90], [110, 120], [50, 120]]), 'utf8');
+      await expect(populateBoard({ repoRoot: repo, schematic: SCH, board: PCB, env: hermetic() })).rejects.toThrow(
+        /would land outside the Edge\.Cuts outline .* not a single rectangle/,
+      );
+      expect(boardFootprints(await readFile(board, 'utf8'))).toEqual([]);
+      // a rectangle with a mounting-hole cutout where the pack starts
+      const hole = '\n\t(gr_circle (center 54 64) (end 56 64) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "00000000-0000-0000-0000-000000000099"))';
+      await writeFile(board, polyOutline(scaffold, [[50, 60], [110, 60], [110, 120], [50, 120]], hole), 'utf8');
+      await expect(populateBoard({ repoRoot: repo, schematic: SCH, board: PCB, env: hermetic() })).rejects.toThrow(/would land outside/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('the scaffold holds board vias to a 0.3 mm drill', async () => {
     const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-rules-'));
     try {
       await mkdir(path.join(repo, '.copperhead'), { recursive: true });
       await bootstrapKicadProject(repo, '# Demo board');
       const rules = await readFile(path.join(repo, 'demo-board.kicad_dru'), 'utf8');
+      // a resumed stage may auto-commit it with the rest of the scaffold
+      expect(isManagedPath('demo-board.kicad_dru', await loadConfig(repo))).toBe(true);
       expect(rules).toContain(`(condition "A.Type == 'Via'")`);
       expect(rules).toContain('(constraint hole_size (min 0.3mm))');
       const board = path.join(repo, PCB);
@@ -770,6 +896,21 @@ describe('an agent run may not raise the unrouted count (AC-15.39)', () => {
       expect(worse.violations.map((v) => v.type)).toEqual(['unrouted_increase']);
       // no board at the start (or no run context board): nothing to compare
       expect((await unroutedGuard({ boardAtStart: null } as RunContext, board, report(9))).ok).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a starting board KiCad cannot load leaves nothing to compare, and run_drc still answers', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'copperhead-unrouted-'));
+    try {
+      const board = path.join(dir, 'b.kicad_pcb');
+      await writeFile(board, 'repaired', 'utf8');
+      const ctx = { boardAtStart: '(kicad_pcb (bogus' } as RunContext;
+      expect((await unroutedGuard(ctx, board, report(9))).ok).toBe(true);
+      expect(ctx.unroutedBaseline).toBe(Infinity);
+      // and every later call answers too, instead of throwing again
+      expect((await unroutedGuard(ctx, board, report(12))).ok).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

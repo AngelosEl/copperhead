@@ -20,7 +20,7 @@ import type { MissingFootprint } from '../kicad/footprints.js';
 import { listSymbols } from '../kicad/sexp.js';
 import { checkLegibility } from '../kicad/legibility.js';
 import { draftSchematicToText, defaultIntentPath } from '../kicad/draft/draft.js';
-import { isDirty, commitAll, changedFiles } from '../util/git.js';
+import { isDirty, commitAll, changedFiles, fileAtCommit, headCommit } from '../util/git.js';
 import type { CompatSettings, CopperheadConfig } from '../config.js';
 import { checkDrift } from '../memory/drift.js';
 import { runAgentLoop, makeProvider, type BudgetExhaustedStats } from '../agent/loop.js';
@@ -266,10 +266,14 @@ export const STAGES: Stage[] = [
       const config = await loadConfig(root);
       if (!config.board || !config.schematic) return false;
       if (!(await boardMatchesSchematic(root, config)).ok) return false;
-      return docHasContent(root, path.join(docs, 'LAYOUT.md'), '## Draft quality');
+      if (!(await docHasContent(root, path.join(docs, 'LAYOUT.md'), '## Draft quality'))) return false;
+      // DRC-clean is part of "done", as ERC is for the schematic stage: a run
+      // killed after Draft quality was written but before a clean run_drc must
+      // not resume as complete and get its board committed unverified
+      return boardDrcOk(root, config.board);
     },
     prompt: () =>
-      'Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn and verified it with DRC; the board is DRC-clean and fully unrouted). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint\'s (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief\'s envelope. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares every footprint and pad net against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed, but a run that ends with more unrouted connections than the board started with fails, since that means a connection was broken — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. The populated board counts as this stage\'s edit, so finishing needs a clean run_drc, run_erc, and check_drift even if you move nothing. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
+      'Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn; a board it has just written passed DRC and starts fully unrouted, and when the stage resumes on a board populated earlier, run run_drc first to see where it stands). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint\'s (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief\'s envelope. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares every footprint and pad net against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed, but a run that ends with more unrouted connections than the board started with fails, since that means a connection was broken — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. The populated board counts as this stage\'s edit, so finishing needs a clean run_drc, run_erc, and check_drift even if you move nothing. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
   },
   {
     name: 'outputs',
@@ -370,6 +374,15 @@ async function boardMatchesSchematic(
   }
 }
 
+/** The board passes DRC (a board KiCad cannot load does not). */
+async function boardDrcOk(root: string, board: string): Promise<boolean> {
+  try {
+    return (await runDrc(path.join(root, board))).ok;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Before the schematic stage (AC-15.32): every BOM.md footprint must be
  * installed. Returns the stop message, or null to proceed. A missing BOM
@@ -429,12 +442,13 @@ async function populateStop(opts: CreateOptions): Promise<string | null> {
     const drc = await runDrc(path.join(opts.repoRoot, config.board));
     if (drc.ok) return null;
     // KiCad resolves footprints through its library tables only; copperhead
-    // also finds the stock install without one, so a machine with no global
-    // fp-lib-table (a fresh headless install) populates fine and then fails
-    // here on every part
+    // also finds the stock install without them, so a library no table lists
+    // (every one, on a fresh headless install with no global fp-lib-table)
+    // populates fine and then fails here
     const unlisted = drc.violations.some((v) => v.type === 'lib_footprint_issues')
-      ? '\nKiCad cannot find the footprint libraries these parts come from: this machine has no global fp-lib-table. ' +
-        "Copy KiCad's default table (the template/fp-lib-table file in KiCad's install) into your KiCad config folder, then re-run."
+      ? "\nKiCad's library tables do not list the libraries these parts come from, though copperhead found them installed. " +
+        "Add them to your global fp-lib-table (or, if you have none, copy KiCad's default table, the template/fp-lib-table file " +
+        'in its install, into your KiCad config folder), then re-run.'
       : '';
     return `the populated board fails DRC before any placement, so ${config.board} was restored:\n${formatViolations(drc)}${unlisted}`;
   } catch (e) {
@@ -459,9 +473,12 @@ async function contractGapDetail(stageName: string, root: string, config: Copper
   if (stageName === 'layout-draft') {
     const fresh = await loadConfig(root);
     const m = await boardMatchesSchematic(root, fresh);
-    return m.ok
-      ? 'the layout-draft contract is not met: LAYOUT.md has no "## Draft quality" section'
-      : `the layout-draft contract is not met: ${m.detail}; restore the populated footprints (never add or rewrite them) and move them instead`;
+    if (!m.ok) {
+      return `the layout-draft contract is not met: ${m.detail}; restore the populated footprints (never add or rewrite them) and move them instead`;
+    }
+    return (await docHasContent(root, path.join(fresh.docs, 'LAYOUT.md'), '## Draft quality'))
+      ? 'the layout-draft contract is not met: the board does not pass DRC; run run_drc and fix what it reports before finishing'
+      : 'the layout-draft contract is not met: LAYOUT.md has no "## Draft quality" section';
   }
   if (stageName !== 'schematic' || !config.schematic) return generic;
   const p = path.join(root, config.schematic);
@@ -491,7 +508,7 @@ const KICAD_STAGES = new Set(['schematic', 'layout-draft', 'outputs']);
 /** True for a path copperhead itself manages inside the pipeline. Used to decide
  *  whether a resumed stage's uncommitted work is safe to auto-commit (2.4): only
  *  when the ENTIRE dirty set is copperhead's, never sweeping up a user's own WIP. */
-function isManagedPath(f: string, config: CopperheadConfig): boolean {
+export function isManagedPath(f: string, config: CopperheadConfig): boolean {
   // config.docs defaults to `docs/` (trailing slash), so normalize before
   // building the prefix — otherwise the check becomes `startsWith('docs//')` and
   // every doc reads as foreign, making commitResumedStage never commit its own
@@ -508,7 +525,7 @@ function isManagedPath(f: string, config: CopperheadConfig): boolean {
     f === '.gitignore' ||
     path.basename(f) === 'sym-lib-table' ||
     path.basename(f) === 'schematic.intent.json' ||
-    /\.(kicad_sch|kicad_pcb|kicad_pro|kicad_prl)$/.test(f)
+    /\.(kicad_sch|kicad_pcb|kicad_pro|kicad_prl|kicad_dru)$/.test(f)
   );
 }
 
@@ -974,12 +991,23 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
     // Layout-draft writes the board before the agent runs (populate), outside
     // the run's own snapshot, so the stage keeps the pre-stage board itself:
     // every attempt starts from it, and a stage that does not complete (a
-    // stop, an abort, exhausted retries, a thrown error) puts it back, so no
-    // unverified board mutation outlives the stage (AC-15.43).
+    // stop, an abort, exhausted retries, a thrown error) puts back the last
+    // verified board, so no unverified board mutation outlives the stage
+    // (AC-15.43). That is the pre-stage board, or the board an attempt
+    // committed: a commit means that attempt's DRC passed, and putting the
+    // older board back over it would leave the tree reverting HEAD.
     const layoutBoard = stage.name === 'layout-draft' ? (await loadConfig(opts.repoRoot)).board : undefined;
     const boardBefore = layoutBoard ? await readFile(path.join(opts.repoRoot, layoutBoard), 'utf8').catch(() => null) : null;
+    const headBefore = layoutBoard ? await headCommit(opts.repoRoot).catch(() => null) : null;
     const restoreBoard = async (): Promise<void> => {
       if (layoutBoard && boardBefore !== null) await writeFile(path.join(opts.repoRoot, layoutBoard), boardBefore, 'utf8');
+    };
+    const restoreVerifiedBoard = async (): Promise<void> => {
+      if (!layoutBoard) return;
+      const head = await headCommit(opts.repoRoot).catch(() => null);
+      const committed = head && head !== headBefore ? await fileAtCommit(opts.repoRoot, head, layoutBoard) : null;
+      if (committed !== null) await writeFile(path.join(opts.repoRoot, layoutBoard), committed, 'utf8');
+      else await restoreBoard();
     };
     try {
       for (let attempt = 1; ; attempt++) {
@@ -1130,7 +1158,7 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
         guidance = diagnosis.guidance ?? `The previous attempt failed: ${failure}. ${diagnosis.reason}`;
       }
     } finally {
-      if (!stageDone) await restoreBoard();
+      if (!stageDone) await restoreVerifiedBoard();
     }
 
     cost.wallMs = Date.now() - stageStart;

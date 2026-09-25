@@ -233,6 +233,7 @@ async function runKicad(args: string[], opts?: { reject?: boolean }): Promise<Aw
 /** Test helper: clear the resolved-binary cache. */
 export function resetKicadCliCache(): void {
   cachedBinary = undefined;
+  cachedMajor = undefined;
 }
 
 /**
@@ -256,6 +257,24 @@ export function setKicadFallbackWinRoots(roots?: readonly string[]): void {
 export async function kicadCliVersion(): Promise<string> {
   const res = await runKicad(['version']);
   return String(res.stdout ?? '').trim();
+}
+
+let cachedMajor: Promise<number | null> | undefined;
+
+/**
+ * The running kicad-cli's major version (10 for "10.0.4"), or null when it
+ * cannot be read. Library lookups use it to read the same KiCad's config and
+ * libraries that DRC will, not whichever install is newest. Cached per process.
+ */
+export function kicadMajorVersion(): Promise<number | null> {
+  cachedMajor ??= kicadCliVersion().then(
+    (v) => {
+      const major = Number(/(\d+)\.\d+/.exec(v)?.[1]);
+      return Number.isFinite(major) ? major : null;
+    },
+    () => null,
+  );
+  return cachedMajor;
 }
 
 async function runCheck(

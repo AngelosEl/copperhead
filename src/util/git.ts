@@ -345,6 +345,12 @@ export async function headCommit(repo: string): Promise<string> {
   return git(repo, ['rev-parse', 'HEAD']);
 }
 
+/** A file's exact bytes at a commit (no trimming), or null when it is not there. */
+export async function fileAtCommit(repo: string, commit: string, rel: string): Promise<string | null> {
+  const res = await execa('git', ['show', `${commit}:${rel.split(path.sep).join('/')}`], { cwd: repo, reject: false, stripFinalNewline: false });
+  return res.exitCode === 0 ? String(res.stdout) : null;
+}
+
 /** Count of uncommitted paths (staged, unstaged, and untracked). */
 export async function uncommittedCount(repo: string): Promise<number> {
   const status = await git(repo, ['status', '--porcelain']);

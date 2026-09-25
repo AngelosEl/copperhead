@@ -27,8 +27,8 @@ export interface CheckReport {
    * USB-C footprint's pad 0.18 mm from its own peg hole). Placement cannot
    * move them and layout may not edit footprints, so they are reported
    * beside the result, never a failure (#314). Anything spanning two parts,
-   * copper outside a footprint, two different nets, or a footprint KiCad
-   * reports as modified or unresolvable stays a violation.
+   * copper outside a footprint, a short between two nets, or a footprint
+   * KiCad reports as modified or unresolvable stays a violation.
    */
   intrinsic?: Violation[];
 }
@@ -100,20 +100,15 @@ export function normalizeReport(raw: unknown, source: 'erc' | 'drc'): CheckRepor
 }
 
 /**
- * Does a finding put two different nets against each other? A short, or a
- * clearance between pads on different nets, is an electrical fault whichever
- * footprint it sits in (two schematic nets wired onto coincident pads of one
- * stock part), so it is never library-intrinsic. KiCad names a pad's net in
- * brackets: "Pad A4 [VCC] of J1 on F.Cu".
+ * Does a finding put two different nets in contact? Only a short does: two
+ * schematic nets wired onto coincident or overlapping pads of one stock part
+ * is an electrical fault whichever footprint it sits in, so it is never
+ * library-intrinsic. A clearance between a footprint's own pads is the
+ * library's geometry even across nets (a USB-C receptacle's DP/DM pads sit
+ * closer than the board rule), and placement cannot change it.
  */
 export function joinsNets(v: Violation): boolean {
-  if (v.type === 'shorting_items') return true;
-  const nets = new Set<string>();
-  for (const i of v.items) {
-    const net = /\[([^\]]*)\]/.exec(i.description)?.[1];
-    if (net && net !== '<no net>') nets.add(net);
-  }
-  return nets.size > 1;
+  return v.type === 'shorting_items';
 }
 
 /**

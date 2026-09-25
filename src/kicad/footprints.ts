@@ -1,6 +1,7 @@
 import { access, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { libTableRows } from './libtable.js';
+import { kicadMajorVersion } from './cli.js';
 import { parseSexp, children, isList } from './sexp.js';
 import { symbolSearchDirs } from './symlib.js';
 
@@ -21,7 +22,11 @@ import { symbolSearchDirs } from './symlib.js';
  * otherwise the standard Linux/macOS paths, the Windows version dirs, and the
  * `footprints/` sibling of each stock symbol dir.
  */
-export async function footprintSearchDirs(env = process.env, winRoot = 'C:/Program Files/KiCad'): Promise<string[]> {
+export async function footprintSearchDirs(
+  env = process.env,
+  winRoot = 'C:/Program Files/KiCad',
+  kicadMajor?: number | null,
+): Promise<string[]> {
   const fromEnv = [env.KICAD_FOOTPRINT_DIR, env.KICAD10_FOOTPRINT_DIR, env.KICAD9_FOOTPRINT_DIR, env.KICAD8_FOOTPRINT_DIR].filter(
     (v): v is string => !!v,
   );
@@ -37,7 +42,9 @@ export async function footprintSearchDirs(env = process.env, winRoot = 'C:/Progr
       const versions = (await readdir(winRoot, { withFileTypes: true }))
         .filter((e) => e.isDirectory())
         .map((e) => e.name)
-        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+        // the running KiCad's own install first, then the rest newest first
+        .sort((a, b) => Number(b.split('.')[0] === String(kicadMajor)) - Number(a.split('.')[0] === String(kicadMajor)));
       for (const v of versions) candidates.push(`${winRoot}/${v}/share/kicad/footprints`);
       candidates.push(`${winRoot}/share/kicad/footprints`);
     } catch {
@@ -103,6 +110,8 @@ export interface FootprintResolverOptions {
   stockDirs?: string[];
   /** Read the user's global fp-lib-table (default true). */
   global?: boolean;
+  /** The running KiCad's major version (defaults to `kicad-cli`'s; null: newest install). */
+  kicadMajor?: number | null;
 }
 
 export class FootprintResolver {
@@ -114,15 +123,19 @@ export class FootprintResolver {
 
   static async create(opts: FootprintResolverOptions): Promise<FootprintResolver> {
     const env = opts.env ?? process.env;
-    const stock = opts.stockDirs ?? (await footprintSearchDirs(env));
+    const major = opts.kicadMajor !== undefined ? opts.kicadMajor : await kicadMajorVersion();
+    const stock = opts.stockDirs ?? (await footprintSearchDirs(env, undefined, major));
     // KiCad's own table rows name the stock dir by a versioned variable; an
-    // install that never exported it still has the dir, so fill it in.
+    // install that never exported it still has the dir, so fill it in, for the
+    // running KiCad's version only: another version's variable names another
+    // version's footprints.
     const defaults: Record<string, string> = {};
-    if (stock[0]) for (const v of [10, 9, 8, 7]) defaults[`KICAD${v}_FOOTPRINT_DIR`] = stock[0];
+    if (stock[0]) for (const v of major != null ? [major] : [10, 9, 8, 7]) defaults[`KICAD${v}_FOOTPRINT_DIR`] = stock[0];
     const { rows, searched } = await libTableRows('fp', {
       projectDir: opts.projectDir,
       env,
       defaults,
+      kicadMajor: major,
       ...(opts.global === undefined ? {} : { global: opts.global }),
     });
     const libs = new Map<string, { dir: string; source: string }>();

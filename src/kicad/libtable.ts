@@ -3,6 +3,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { parseSexp, children, child, isList, type SexpNode } from './sexp.js';
+import { kicadMajorVersion } from './cli.js';
 
 /**
  * KiCad library tables (`fp-lib-table`, `sym-lib-table`), read the way KiCad
@@ -52,9 +53,11 @@ export function expandUri(uri: string, vars: Record<string, string | undefined>)
 /**
  * KiCad's per-user config root, newest version dir first (`~/.config/kicad/10.0`,
  * `~/Library/Preferences/kicad/10.0`, `%APPDATA%\kicad\10.0`).
- * `KICAD_CONFIG_HOME` replaces the platform root, as it does in KiCad.
+ * `KICAD_CONFIG_HOME` replaces the platform root, as it does in KiCad. Given
+ * the running KiCad's major version, only that version's dirs: KiCad reads its
+ * own config, never a newer or older install's.
  */
-export async function kicadConfigDirs(env = process.env, platform = process.platform): Promise<string[]> {
+export async function kicadConfigDirs(env = process.env, platform = process.platform, major?: number | null): Promise<string[]> {
   const home = env.HOME || env.USERPROFILE || os.homedir();
   const base =
     env.KICAD_CONFIG_HOME ||
@@ -69,6 +72,7 @@ export async function kicadConfigDirs(env = process.env, platform = process.plat
     versions = (await readdir(base, { withFileTypes: true }))
       .filter((e) => e.isDirectory() && /^\d+(\.\d+)*$/.test(e.name))
       .map((e) => e.name)
+      .filter((v) => major === undefined || major === null || v.split('.')[0] === String(major))
       .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
   } catch {
     return [];
@@ -84,10 +88,16 @@ export async function kicadConfigDirs(env = process.env, platform = process.plat
  * (Preferences > Configure Paths). Without them such a row expands to nothing
  * and an installed library reads as missing.
  */
-export async function kicadPathVars(env = process.env, platform = process.platform): Promise<Record<string, string>> {
+export async function kicadPathVars(
+  env = process.env,
+  platform = process.platform,
+  kicadMajor?: number | null,
+): Promise<Record<string, string>> {
   const vars: Record<string, string> = {};
-  const configDir = (await kicadConfigDirs(env, platform))[0];
-  const version = configDir ? path.basename(configDir) : null;
+  const configDir = (await kicadConfigDirs(env, platform, kicadMajor))[0];
+  // the running KiCad defines its own version's variables whether or not it
+  // has written a config dir yet
+  const version = configDir ? path.basename(configDir) : kicadMajor != null ? `${kicadMajor}.0` : null;
   if (version) {
     const home = env.HOME || env.USERPROFILE || os.homedir();
     const major = version.split('.')[0];
@@ -97,7 +107,8 @@ export async function kicadPathVars(env = process.env, platform = process.platfo
         : path.join(env.KICAD_DOCUMENTS_HOME || path.join(home, 'Documents'), 'KiCad');
     vars[`KICAD${major}_3RD_PARTY`] = path.join(dataRoot, version, '3rdparty');
     try {
-      const common = JSON.parse(await readFile(path.join(configDir!, 'kicad_common.json'), 'utf8')) as {
+      if (!configDir) throw new Error('no config dir');
+      const common = JSON.parse(await readFile(path.join(configDir, 'kicad_common.json'), 'utf8')) as {
         environment?: { vars?: Record<string, unknown> | null };
       };
       for (const [k, v] of Object.entries(common.environment?.vars ?? {})) if (typeof v === 'string' && v) vars[k] = v;
@@ -136,7 +147,8 @@ async function readTable(
     if (!name || !rawUri) continue;
     const uri = expandUri(rawUri, vars);
     if (!uri) continue;
-    const abs = path.isAbsolute(uri) ? uri : path.resolve(path.dirname(file), uri);
+    // normalized: `${KIPRJMOD}/lib` on Windows would otherwise mix separators
+    const abs = path.isAbsolute(uri) ? path.normalize(uri) : path.resolve(path.dirname(file), uri);
     if (type === 'Table') {
       await readTable(abs, vars, source, depth + 1, out);
     } else if (type === 'KiCad' && !out.some((r) => r.name === name)) {
@@ -153,6 +165,13 @@ export interface LibTableOptions {
   defaults?: Record<string, string>;
   /** Read the user's global table too (default true). */
   global?: boolean;
+  /**
+   * The running KiCad's major version, whose config and variables apply.
+   * Defaults to `kicad-cli`'s; null reads the newest install.
+   */
+  kicadMajor?: number | null;
+  /** Platform whose default paths apply (tests); defaults to this one. */
+  platform?: NodeJS.Platform;
 }
 
 /**
@@ -164,9 +183,11 @@ export async function libTableRows(
   opts: LibTableOptions,
 ): Promise<{ rows: Map<string, LibTableRow>; searched: string[] }> {
   const env = opts.env ?? process.env;
+  const platform = opts.platform ?? process.platform;
+  const major = opts.kicadMajor !== undefined ? opts.kicadMajor : await kicadMajorVersion();
   const vars: Record<string, string | undefined> = {
     ...opts.defaults,
-    ...(await kicadPathVars(env)),
+    ...(await kicadPathVars(env, platform, major)),
     ...env,
     KIPRJMOD: opts.projectDir,
   };
@@ -178,7 +199,7 @@ export async function libTableRows(
     await readTable(projectTable, vars, `project ${TABLE_FILE[kind]}`, 0, rows);
   }
   if (opts.global !== false) {
-    for (const dir of await kicadConfigDirs(env)) {
+    for (const dir of await kicadConfigDirs(env, platform, major)) {
       const table = path.join(dir, TABLE_FILE[kind]);
       if (!existsSync(table)) continue;
       const label = `global ${TABLE_FILE[kind]} (KiCad ${path.basename(dir)})`;

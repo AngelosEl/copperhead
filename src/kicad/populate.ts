@@ -100,6 +100,29 @@ export function parseNetlist(text: string): Netlist {
   return { parts, nets };
 }
 
+/** A point turned by `deg` as KiCad turns a footprint: Y down, positive is counterclockwise on screen. */
+function rotate(x: number, y: number, deg: number): [number, number] {
+  const r = (deg * Math.PI) / 180;
+  const c = Math.cos(r);
+  const s = Math.sin(r);
+  return [x * c + y * s, -x * s + y * c];
+}
+
+/**
+ * A board stores a footprint's own zones (an ESP32 module's antenna keepout)
+ * in board coordinates, unlike its pads and graphics, so they must move with
+ * the part: every point p becomes `to + rotate(p - from, delta)`. Left at the
+ * library's origin, the zone makes KiCad report the footprint as modified.
+ */
+function moveZonePoints(zoneText: string, from: { x: number; y: number }, to: { x: number; y: number }, delta: number): string {
+  return zoneText.replace(/\((xy|start|mid|end)\s+(-?[\d.]+)\s+(-?[\d.]+)\)/g, (_, k: string, xs: string, ys: string) => {
+    const [rx, ry] = rotate(Number(xs) - from.x, Number(ys) - from.y, delta);
+    // KiCad's own resolution (1 nm): a coarser point reads as an edited zone
+    const nm = (n: number): string => String(Math.round(n * 1e6) / 1e6);
+    return `(${k} ${nm(to.x + rx)} ${nm(to.y + ry)})`;
+  });
+}
+
 const q = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 const num = (n: number): string => String(Math.round(n * 1e4) / 1e4);
 
@@ -220,6 +243,8 @@ export function instantiateFootprint(modText: string, inst: Instance): string {
         .replace(new RegExp(`^\\(property\\s+"Value"\\s+${token}`), `(property "Value" ${q(inst.value)}`)
         .replace(new RegExp(`^\\(fp_text\\s+reference\\s+${token}`), `(fp_text reference ${q(inst.ref)}`)
         .replace(new RegExp(`^\\(fp_text\\s+value\\s+${token}`), `(fp_text value ${q(inst.value)}`);
+    } else if (s.tag === 'zone') {
+      t = moveZonePoints(t, { x: 0, y: 0 }, inst.at, 0);
     } else if (s.tag === 'pad') {
       const pad = /^\(pad\s+"((?:[^"\\]|\\.)*)"/.exec(t)?.[1] ?? /^\(pad\s+([^\s()"]+)/.exec(t)?.[1] ?? '';
       const net = pad ? inst.padNet(pad) : undefined;
@@ -420,6 +445,110 @@ function outlineBox(boardText: string, open: number): Bounds | null {
   return Number.isFinite(b.minX) ? b : null;
 }
 
+type Segment = [number, number, number, number];
+
+/**
+ * Edge.Cuts as straight segments: lines, rectangles, polygons, arcs (sampled
+ * through their midpoint), and circles (as 32-gons). Enough to tell whether a
+ * packed part lies inside an outline populate cannot resize.
+ */
+function outlineSegments(boardText: string, open: number): Segment[] {
+  const segs: Segment[] = [];
+  const pt = (t: string, k: string): [number, number] | null => {
+    const m = new RegExp(`\\(${k}\\s+(-?[\\d.]+)\\s+(-?[\\d.]+)\\)`).exec(t);
+    return m ? [Number(m[1]), Number(m[2])] : null;
+  };
+  const ring = (pts: [number, number][]): void => {
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i]!;
+      const b = pts[(i + 1) % pts.length]!;
+      segs.push([a[0], a[1], b[0], b[1]]);
+    }
+  };
+  for (const span of childSpans(boardText, open)) {
+    if (!/^gr_(line|arc|circle|poly|rect)$/.test(span.tag)) continue;
+    const t = boardText.slice(span.start, span.end);
+    if (!/\(layer\s+"?Edge\.Cuts"?\)/.test(t)) continue;
+    const start = pt(t, 'start');
+    const end = pt(t, 'end');
+    if (span.tag === 'gr_line' && start && end) segs.push([start[0], start[1], end[0], end[1]]);
+    else if (span.tag === 'gr_rect' && start && end) {
+      ring([start, [end[0], start[1]], end, [start[0], end[1]]]);
+    } else if (span.tag === 'gr_circle') {
+      const c = pt(t, 'center');
+      if (!c || !end) continue;
+      const r = Math.hypot(end[0] - c[0], end[1] - c[1]);
+      ring(Array.from({ length: 32 }, (_, i) => [c[0] + r * Math.cos((i * Math.PI) / 16), c[1] + r * Math.sin((i * Math.PI) / 16)]));
+    } else if (span.tag === 'gr_poly') {
+      ring([...t.matchAll(/\(xy\s+(-?[\d.]+)\s+(-?[\d.]+)\)/g)].map((m) => [Number(m[1]), Number(m[2])]));
+    } else if (span.tag === 'gr_arc' && start && end) {
+      const mid = pt(t, 'mid');
+      if (!mid) {
+        segs.push([start[0], start[1], end[0], end[1]]);
+        continue;
+      }
+      // the circle through start, mid, end; sample from start to end through mid
+      const [ax, ay] = start;
+      const [bx, by] = mid;
+      const [cx, cy] = end;
+      const d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+      if (Math.abs(d) < 1e-9) {
+        segs.push([ax, ay, bx, by], [bx, by, cx, cy]);
+        continue;
+      }
+      const ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay) + (cx * cx + cy * cy) * (ay - by)) / d;
+      const uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx) + (cx * cx + cy * cy) * (bx - ax)) / d;
+      const r = Math.hypot(ax - ux, ay - uy);
+      const ang = (x: number, y: number): number => Math.atan2(y - uy, x - ux);
+      const a0 = ang(ax, ay);
+      let sweep = ang(cx, cy) - a0;
+      let toMid = ang(bx, by) - a0;
+      const norm = (v: number): number => ((v % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      sweep = norm(sweep);
+      toMid = norm(toMid);
+      if (toMid > sweep) sweep -= 2 * Math.PI; // mid lies the other way round
+      const n = 16;
+      let prev: [number, number] = [ax, ay];
+      for (let i = 1; i <= n; i++) {
+        const a = a0 + (sweep * i) / n;
+        const next: [number, number] = i === n ? [cx, cy] : [ux + r * Math.cos(a), uy + r * Math.sin(a)];
+        segs.push([prev[0], prev[1], next[0], next[1]]);
+        prev = next;
+      }
+    }
+  }
+  return segs;
+}
+
+/** Even-odd: inside the outline (and outside any cutout it draws). */
+function insideOutline(segs: Segment[], x: number, y: number): boolean {
+  let inside = false;
+  for (const [x1, y1, x2, y2] of segs) {
+    if (y1 > y !== y2 > y && x < x1 + ((y - y1) * (x2 - x1)) / (y2 - y1)) inside = !inside;
+  }
+  return inside;
+}
+
+/** Does any outline segment cross into the box? */
+function outlineCrossesBox(segs: Segment[], b: Bounds): boolean {
+  const inBox = (x: number, y: number): boolean => x > b.minX && x < b.maxX && y > b.minY && y < b.maxY;
+  const cross = (p: Segment, q: Segment): boolean => {
+    const o = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number): number =>
+      Math.sign((bx - ax) * (cy - ay) - (by - ay) * (cx - ax));
+    return (
+      o(p[0], p[1], p[2], p[3], q[0], q[1]) * o(p[0], p[1], p[2], p[3], q[2], q[3]) < 0 &&
+      o(q[0], q[1], q[2], q[3], p[0], p[1]) * o(q[0], q[1], q[2], q[3], p[2], p[3]) < 0
+    );
+  };
+  const edges: Segment[] = [
+    [b.minX, b.minY, b.maxX, b.minY],
+    [b.maxX, b.minY, b.maxX, b.maxY],
+    [b.maxX, b.maxY, b.minX, b.maxY],
+    [b.minX, b.maxY, b.minX, b.minY],
+  ];
+  return segs.some((s) => inBox(s[0], s[1]) || inBox(s[2], s[3]) || edges.some((e) => cross(s, e)));
+}
+
 const GAP = 1; // mm between courtyards
 const MARGIN = 1; // mm from the outline
 
@@ -557,6 +686,35 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
         'grows only a single-rectangle outline; enlarge the Edge.Cuts outline, then re-run',
     );
   }
+  if (fixed) {
+    // the box is not the board: an L-shape, a circle, or a cutout leaves parts
+    // of it off-board, so every packed part must lie inside the real outline
+    const segs = outlineSegments(boardText, open);
+    const outside = order
+      .filter((_, i) => {
+        const b: Bounds = {
+          minX: origin.x + origins[i]!.x,
+          minY: origin.y + origins[i]!.y,
+          maxX: origin.x + origins[i]!.x + boxes[i]!.w,
+          maxY: origin.y + origins[i]!.y + boxes[i]!.h,
+        };
+        const corners: [number, number][] = [
+          [b.minX, b.minY],
+          [b.maxX, b.minY],
+          [b.minX, b.maxY],
+          [b.maxX, b.maxY],
+        ];
+        return corners.some(([x, y]) => !insideOutline(segs, x, y)) || outlineCrossesBox(segs, b);
+      })
+      .map((p) => p.ref);
+    if (outside.length) {
+      throw new Error(
+        `packed on a grid, ${outside.join(', ')} would land outside the Edge.Cuts outline of ${opts.board}, which is not a ` +
+          'single rectangle, and populate grows only a single-rectangle outline; make room inside the outline, or use a ' +
+          'rectangular one and shape it after placement, then re-run',
+      );
+    }
+  }
 
   // splice: net table after `(net 0 "")` (or before the first footprint-able
   // item), outline grown when the pack overflows it, footprints before the
@@ -624,7 +782,8 @@ const atText = (x: number, y: number, a: number): string => `(at ${num(x)} ${num
  * A KiCad board stores every pad's and text's angle as ABSOLUTE, so turning a
  * footprint by editing only its own `(at X Y ROT)` leaves the pads facing the
  * old way: the part no longer matches its library and fine-pitch pads short
- * into each other. This rotates them together, by anchored splices only.
+ * into each other. Its zones are stored in board coordinates, so they move
+ * and turn with it too. All by anchored splices only.
  */
 export function moveFootprint(boardText: string, ref: string, x: number, y: number, rotation?: number): string {
   const open = boardText.indexOf('(kicad_pcb');
@@ -644,6 +803,11 @@ export function moveFootprint(boardText: string, ref: string, x: number, y: numb
   const to = normAngle(rotation ?? from);
   const delta = to - from;
   const edits: { start: number; end: number; text: string }[] = [{ start: at.start, end: at.end, text: atText(x, y, to) }];
+  for (const k of kids) {
+    if (k.tag !== 'zone') continue;
+    const from = { x: nums[0] ?? 0, y: nums[1] ?? 0 };
+    edits.push({ start: k.start, end: k.end, text: moveZonePoints(boardText.slice(k.start, k.end), from, { x, y }, delta) });
+  }
   if (delta) {
     for (const k of kids) {
       if (k.tag !== 'pad' && k.tag !== 'property' && k.tag !== 'fp_text') continue;

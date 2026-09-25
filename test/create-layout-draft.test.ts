@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -8,6 +8,8 @@ import type { RunOptions } from '../src/agent/loop.js';
 import { bootstrapKicadProject } from '../src/kicad/bootstrap.js';
 import { draftSchematic } from '../src/kicad/draft/draft.js';
 import { boardFootprints } from '../src/kicad/populate.js';
+import { footprintSearchDirs } from '../src/kicad/footprints.js';
+import { seededKicadConfig } from './helpers.js';
 
 /**
  * The create pipeline's layout-draft stage around board populate (#314):
@@ -95,10 +97,19 @@ const run = (repo: string, brief: string, lines: string[] = []): ReturnType<type
   runCreate({ repoRoot: repo, briefPath: brief, model: 'gpt-5', log: (l) => lines.push(l) });
 
 describe('create layout-draft around board populate (#314)', () => {
+  let seeded: { dir: string; cleanup: () => Promise<void> };
+  beforeAll(async () => {
+    seeded = await seededKicadConfig((await footprintSearchDirs())[0]!);
+  });
+  afterAll(async () => {
+    await seeded.cleanup();
+  });
   beforeEach(() => {
     // the schematic stage's completion re-drafts the IR; point it at the
     // fixture symbols the sheet was drafted from
     vi.stubEnv('KICAD_SYMBOL_DIR', SYMLIB);
+    // KiCad resolves stock footprints through a global fp-lib-table, not this machine's
+    vi.stubEnv('KICAD_CONFIG_HOME', seeded.dir);
     layout.attempts = [];
     layout.calls = [];
     layout.boards = [];
@@ -121,6 +132,29 @@ describe('create layout-draft around board populate (#314)', () => {
       expect(boardFootprints(layout.boards[0]!).length).toBe(5);
       // ... and the stop put the scaffold board back
       expect(await readFile(path.join(repo, PCB), 'utf8')).toBe(before);
+    } finally {
+      await cleanup();
+    }
+  }, 180_000);
+
+  it('a stage that fails after an attempt committed leaves that verified board, not the pre-stage one', async () => {
+    const { repo, brief, cleanup } = await projectAtLayoutDraft();
+    try {
+      layout.attempts = [
+        // attempt 1 commits the populated board (its DRC passed) but never
+        // writes LAYOUT.md's Draft quality, so the stage contract fails
+        async (opts) => {
+          await execa('git', ['add', '-A'], { cwd: opts.repoRoot });
+          await execa('git', ['commit', '-q', '-m', 'layout attempt'], { cwd: opts.repoRoot });
+          return 'success';
+        },
+      ];
+      const res = await run(repo, brief);
+      expect(res.ok).toBe(false);
+      const board = await readFile(path.join(repo, PCB), 'utf8');
+      expect(boardFootprints(board).length).toBe(5);
+      expect((await execa('git', ['show', `HEAD:${PCB}`], { cwd: repo, stripFinalNewline: false })).stdout).toBe(board);
+      expect((await execa('git', ['status', '--porcelain', '--', PCB], { cwd: repo })).stdout).toBe('');
     } finally {
       await cleanup();
     }
@@ -150,7 +184,7 @@ describe('create layout-draft around board populate (#314)', () => {
       const out = lines.join('\n');
       expect(out).toContain('the populated board fails DRC before any placement');
       expect(out).toContain('lib_footprint_issues');
-      expect(out).toContain('no global fp-lib-table');
+      expect(out).toContain("KiCad's library tables do not list the libraries these parts come from");
       expect(await readFile(path.join(repo, PCB), 'utf8')).toBe(before);
     } finally {
       await rm(emptyConfig, { recursive: true, force: true });
