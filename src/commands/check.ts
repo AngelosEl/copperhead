@@ -17,7 +17,7 @@ import { openspecValidate } from '../openspec/cli.js';
 export interface CheckResult {
   ok: boolean;
   erc: { ok: boolean; violations: number } | null;
-  drc: { ok: boolean; violations: number } | null;
+  drc: { ok: boolean; violations: number; unrouted: number; intrinsic: number } | null;
   drift: { ok: boolean; mismatches: DriftMismatch[]; warning?: string };
   openspec: { ok: boolean; detail: string } | null;
   constraints: { ok: boolean; violations: ConstraintViolation[] };
@@ -51,7 +51,7 @@ export async function runCheck(repoRoot: string, log: (s: string) => void): Prom
 
   if (config.board && existsSync(path.join(repoRoot, config.board))) {
     drc = await runDrc(path.join(repoRoot, config.board));
-    log(drc.ok ? 'DRC ✓' : formatViolations(drc));
+    log(drc.ok && !drc.intrinsic?.length ? `DRC ✓${drc.unrouted ? ` (${drc.unrouted} unrouted)` : ''}` : formatViolations(drc));
   } else {
     log('DRC skipped (no board configured)');
   }
@@ -132,7 +132,7 @@ export async function runCheck(repoRoot: string, log: (s: string) => void): Prom
   return {
     ok,
     erc: erc ? { ok: erc.ok, violations: erc.violations.length } : null,
-    drc: drc ? { ok: drc.ok, violations: drc.violations.length } : null,
+    drc: drc ? { ok: drc.ok, violations: drc.violations.length, unrouted: drc.unrouted ?? 0, intrinsic: drc.intrinsic?.length ?? 0 } : null,
     drift: { ok: drift.length === 0, mismatches: drift, ...(driftWarning ? { warning: driftWarning } : {}) },
     openspec,
     constraints: { ok: constraintViolations.length === 0, violations: constraintViolations },

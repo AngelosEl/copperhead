@@ -4,6 +4,7 @@ import path from 'node:path';
 import { parseSexp, children, child, isList, type SexpNode, type Bounds } from '../sexp.js';
 import { symbolSearchDirs, findLibraryFile, findSymbolAcrossLibraries, closestSymbolNames } from '../symlib.js';
 import { EMIT_VERSION, renameSymbolBlock } from '../emit.js';
+import { libTableRows } from '../libtable.js';
 
 /**
  * Symbol resolution for the drafting engine, with hermetic vendoring (design
@@ -282,6 +283,26 @@ async function crossLibrarySuggestions(name: string, lib: string, dirs: string[]
 
 export class SymbolSource {
   private cache = new Map<string, ResolvedSymbol>();
+  private projectLibs: Promise<Map<string, string>> | null = null;
+
+  /**
+   * Libraries the project's own `sym-lib-table` names (#314): a project-local
+   * vendor library (an Espressif module, say) resolves without copying the
+   * stock set around it. Rows pointing into the vendored cache are skipped,
+   * since `resolve` reads the cache first anyway.
+   */
+  private async projectLibrary(lib: string): Promise<string | null> {
+    this.projectLibs ??= (async () => {
+      const { rows } = await libTableRows('sym', { projectDir: this.repoRoot, global: false });
+      const cache = path.resolve(this.cacheDir());
+      const out = new Map<string, string>();
+      for (const [name, row] of rows) {
+        if (!path.resolve(row.uri).startsWith(cache + path.sep) && existsSync(row.uri)) out.set(name, row.uri);
+      }
+      return out;
+    })();
+    return (await this.projectLibs).get(lib) ?? null;
+  }
 
   /**
    * @param repoRoot project root; the vendored cache lives at `<root>/sym-lib-cache/`
@@ -397,7 +418,7 @@ export class SymbolSource {
     }
     if (!block) {
       const dirs = this.searchDirs ?? (await symbolSearchDirs());
-      const file = await findLibraryFile(lib, dirs);
+      const file = (await this.projectLibrary(lib)) ?? (await findLibraryFile(lib, dirs));
       if (!file) {
         const elsewhere = await crossLibrarySuggestions(name, lib, dirs);
         if (elsewhere.length) throw new SymbolResolutionError(libId, 'found-elsewhere', elsewhere);

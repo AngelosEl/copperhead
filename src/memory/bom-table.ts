@@ -255,6 +255,37 @@ export interface TableRow {
   }
 
   /**
+   * A BOM.md Footprint cell as a `Lib:Name` id (#314): markdown backticks and
+   * spacing dropped, and a placeholder ("-", "N/A", "TBD", "none") read as no
+   * footprint at all, so it is reported as unassigned rather than looked up.
+   */
+  export function bomFootprintId(cell: string | undefined): string {
+    const s = normalizeFootprint((cell ?? '').replace(/`/g, ''));
+    return /^(-|—|–|n\/?a|tbd|none)?$/i.test(s) ? '' : s;
+  }
+
+  /**
+   * (refdes, footprint id) for every row of a BOM.md table that HAS a
+   * Footprint column (#314). Unlike `parseBomTable` there is no positional
+   * fallback: a supporting table (pin assignments, a current budget, costs)
+   * has no footprint, and its third cell is not one. First row per refdes wins.
+   */
+  export function bomFootprintRows(md: string): { refdes: string; footprint: string }[] {
+    const out = new Map<string, string>();
+    for (const { header, rows } of parseCanonicalTables(md)) {
+      const refI = header.cells.findIndex((c) => /^refdes$/i.test(c));
+      const fpI = header.cells.findIndex((c) => /^footprint$/i.test(c));
+      if (refI < 0 || fpI < 0) continue;
+      for (const row of rows) {
+        const refdes = row.cells[refI]?.replace(/[`*]/g, '').trim();
+        if (!refdes || out.has(refdes)) continue;
+        out.set(refdes, bomFootprintId(row.cells[fpI]));
+      }
+    }
+    return [...out].map(([refdes, footprint]) => ({ refdes, footprint }));
+  }
+
+  /**
    * Which of the canonical pin-assignment columns PINOUT.md actually provides.
    * `checkDrift` uses this to emit ONE explicit "no Net column" message when the
    * doc omits the column entirely, instead of silently checking nothing (a

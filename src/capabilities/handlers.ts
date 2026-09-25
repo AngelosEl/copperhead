@@ -8,6 +8,8 @@ import { listSymbols, listNets } from '../kicad/sexp.js';
 import { checkLegibility, formatLegibility } from '../kicad/legibility.js';
 import { scoreSchematic, formatScore } from '../kicad/score.js';
 import { draftSchematic, defaultIntentPath, formatSchematicDraftReport } from '../kicad/draft/draft.js';
+import { FootprintResolver } from '../kicad/footprints.js';
+import { moveFootprint } from '../kicad/populate.js';
 import { verifySchematicSymbols, searchInstalledSymbols, symbolSearchDirs, resolveLibrarySymbol, comparePinNumbers } from '../kicad/symlib.js';
 import { checkDrift } from '../memory/drift.js';
 import { saveConstraint, classifyAffectsTarget, affectsTargetExists } from '../memory/constraints.js';
@@ -234,6 +236,49 @@ export const HANDLERS: HandlerDef[] = [
   },
   {
     schema: {
+      name: 'move_footprint',
+      description:
+        'Move and/or rotate one placed footprint on the board, by refdes. Always use this to place parts: it turns the pads and text with the footprint. KiCad stores pad angles as absolute, so hand-editing a footprint\'s (at X Y ROT) turns only the outline and leaves the pads facing the old way — the part no longer matches its library and fine-pitch pads short together. Requires a validated change proposal first, like edit_file.',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'string', description: 'refdes, e.g. "J1"' },
+          x: { type: 'number', description: 'footprint origin X in mm (board coordinates)' },
+          y: { type: 'number', description: 'footprint origin Y in mm (board coordinates, Y down)' },
+          rotation: { type: 'number', description: 'absolute rotation in degrees (0, 90, 180, 270); omit to keep the current one' },
+        },
+        required: ['ref', 'x', 'y'],
+      },
+    },
+    requiresUnlock: true,
+    handler: async (ctx, args) => {
+      const rel = ctx.config.board;
+      if (!rel) return 'no board configured; nothing to move';
+      const ref = str(args, 'ref');
+      const x = Number(args.x);
+      const y = Number(args.y);
+      const rotation = args.rotation === undefined ? undefined : Number(args.rotation);
+      if (![x, y, rotation ?? 0].every(Number.isFinite)) return 'x, y (and rotation if given) must be numbers';
+      const abs = resolveInRepo(ctx.repoRoot, rel);
+      const before = await readFile(abs, 'utf8');
+      let after: string;
+      try {
+        after = moveFootprint(before, ref, x, y, rotation);
+      } catch (e) {
+        return `not moved: ${(e as Error).message}`;
+      }
+      await writeFile(abs, after, 'utf8');
+      const loadErr = await kicadLoadError(abs);
+      if (loadErr) {
+        await writeFile(abs, before, 'utf8');
+        return `move REVERTED: the board would not load in KiCad. kicad-cli says:\n${loadErr}`;
+      }
+      markTouched(ctx, rel);
+      return `moved ${ref} to (${x}, ${y})${rotation === undefined ? '' : ` at ${rotation}°`}; pads and text turned with it. Run run_drc after this batch of moves.`;
+    },
+  },
+  {
+    schema: {
       name: 'write_file',
       description:
         'Create a new file (docs, outputs). Requires a validated change proposal first (propose_change then validate_change to unlock edits). Refuses to overwrite anything or to create KiCad files.',
@@ -306,6 +351,46 @@ export const HANDLERS: HandlerDef[] = [
         return `no installed symbol matches "${query}" (searched every library in: ${dirs.join(', ')}). The part is not capturable on this machine as named — choose a part whose symbol exists, or a same-family variant that does.`;
       }
       return `installed symbols matching "${query}":\n${hits.map((h) => `  - ${h}`).join('\n')}`;
+    },
+  },
+  {
+    schema: {
+      name: 'check_footprints',
+      description:
+        'Resolve KiCad footprint ids (Lib:Name) exactly as the board will: the project fp-lib-table, the user\'s global fp-lib-table, then the stock footprint libraries. Returns OK or the reason for each id (no such library, no such footprint in that library, not a Lib:Name id) with the closest INSTALLED ids. Every BOM.md Footprint cell must resolve here: nothing is ever substituted later, and a footprint that is not installed stops the run for the user. Call it on every footprint before finishing part selection.',
+      parameters: {
+        type: 'object',
+        properties: {
+          footprints: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'footprint ids, e.g. ["Resistor_SMD:R_0603_1608Metric", "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal"]',
+          },
+        },
+        required: ['footprints'],
+      },
+    },
+    requiresUnlock: false,
+    handler: async (ctx, args) => {
+      const ids = Array.isArray(args.footprints) ? args.footprints.filter((f): f is string => typeof f === 'string') : [];
+      if (!ids.length) return 'pass footprints: an array of Lib:Name footprint ids';
+      const anchor = ctx.config.board ?? ctx.config.schematic;
+      const resolver = await FootprintResolver.create({
+        projectDir: anchor ? path.dirname(path.join(ctx.repoRoot, anchor)) : ctx.repoRoot,
+      });
+      const lines: string[] = [];
+      for (const id of ids) {
+        const r = await resolver.resolve(id);
+        if (r.ok) {
+          lines.push(`OK  ${id}`);
+          continue;
+        }
+        const lib = id.includes(':') ? id.slice(0, id.indexOf(':')) : '';
+        const why =
+          r.why === 'bad-id' ? 'not a Lib:Name id' : r.why === 'no-library' ? `no library named "${lib}" is installed` : `library "${lib}" has no such footprint`;
+        lines.push(`MISS ${id}: ${why}${r.near.length ? `; installed: ${r.near.join(', ')}` : ''}`);
+      }
+      return `${lines.join('\n')}\n(searched: ${resolver.searched.join(', ') || 'no footprint libraries found'})`;
     },
   },
   {
@@ -417,6 +502,9 @@ export const HANDLERS: HandlerDef[] = [
         schematic: ctx.config.schematic,
         intentPath: intentRel,
         docsDir: ctx.config.docs,
+        footprints: await FootprintResolver.create({
+          projectDir: path.dirname(path.join(ctx.repoRoot, ctx.config.schematic)),
+        }),
       });
       if (!res.ok) return { ok: false, text: res.message };
       markTouched(ctx, ctx.config.schematic);

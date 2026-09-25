@@ -5,6 +5,7 @@ import { mkdtemp, cp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { validateIntent, parseIntent, looksLikeDescription } from '../src/kicad/draft/ir.js';
 import { SymbolSource } from '../src/kicad/draft/symsource.js';
+import { FootprintResolver } from '../src/kicad/footprints.js';
 
 /**
  * The BOM.md ↔ intent cross-check (`validateIntent`, design D6).
@@ -171,6 +172,72 @@ describe('validateIntent: BOM.md cross-check', () => {
       const res = await validateFixture(repo, docs);
       expect(res.findings.map((f) => f.detail)).toEqual([]);
       expect(res.ok).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe('footprint cross-check (#314, AC-15.34)', () => {
+  /** Rewrite one refdes's Footprint cell in the fixture BOM. */
+  async function setBomFootprint(docs: string, ref: string, footprint: string): Promise<void> {
+    const file = path.join(docs, 'BOM.md');
+    const out = (await readFile(file, 'utf8'))
+      .split('\n')
+      .map((line) => {
+        const cells = line.split('|');
+        if (cells.length < 4 || cells[1]?.trim() !== ref) return line;
+        cells[3] = ` ${footprint} `;
+        return cells.join('|');
+      })
+      .join('\n');
+    await writeFile(file, out, 'utf8');
+  }
+
+  it('refuses an intent footprint that differs from its BOM row, naming both', async () => {
+    const { repo, docs, cleanup } = await fixtureRepo();
+    try {
+      await setBomFootprint(docs, 'C1', 'Capacitor_SMD:C_0603_1608Metric');
+      const res = await validateFixture(repo, docs);
+      expect(res.ok).toBe(false);
+      const detail = res.findings.map((f) => f.detail).join('\n');
+      expect(detail).toContain('C1 footprint "Capacitor_SMD:C_0402_1005Metric" differs from BOM.md\'s "Capacitor_SMD:C_0603_1608Metric"');
+      expect(detail).toContain('do not substitute');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('reads a backtick-wrapped BOM cell as the same id', async () => {
+    const { repo, docs, cleanup } = await fixtureRepo();
+    try {
+      await setBomFootprint(docs, 'C1', '`Capacitor_SMD:C_0402_1005Metric`');
+      expect((await validateFixture(repo, docs)).ok).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('with a footprint resolver, refuses symbol pins the footprint has no pad for', async () => {
+    const { repo, docs, cleanup } = await fixtureRepo();
+    try {
+      // intent and BOM agree on a one-pad footprint for a two-pin capacitor
+      await setBomFootprint(docs, 'C1', 'TestPoint:TestPoint_Pad_D1.0mm');
+      const intentPath = path.join(repo, 'schematic.intent.json');
+      await writeFile(
+        intentPath,
+        (await readFile(intentPath, 'utf8')).replace('Capacitor_SMD:C_0402_1005Metric', 'TestPoint:TestPoint_Pad_D1.0mm'),
+        'utf8',
+      );
+      const { intent } = parseIntent(await readFile(intentPath, 'utf8'));
+      const footprints = await FootprintResolver.create({ projectDir: repo, global: false });
+      const res = await validateIntent(intent!, new SymbolSource(repo, [SYMLIB]), docs, footprints);
+      expect(res.ok).toBe(false);
+      expect(res.findings.map((f) => f.detail).join('\n')).toContain(
+        'C1: pin(s) 2 have no pad in footprint TestPoint:TestPoint_Pad_D1.0mm (its pads: 1)',
+      );
+      // without a resolver (standalone drafts, the reference corpus) the check does not run
+      expect((await validateIntent(intent!, new SymbolSource(repo, [SYMLIB]), docs)).ok).toBe(true);
     } finally {
       await cleanup();
     }

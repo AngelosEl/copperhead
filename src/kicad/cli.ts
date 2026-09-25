@@ -330,6 +330,22 @@ export function runDrc(pcbPath: string): Promise<CheckReport> {
   return runCheck('drc', pcbPath);
 }
 
+/** The schematic's KiCad netlist (kicadsexpr), as text. Throws kicad-cli's own error. */
+export async function exportNetlist(schPath: string): Promise<string> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'copperhead-netlist-'));
+  const out = path.join(dir, 'board.net');
+  try {
+    const res = await runKicad(['sch', 'export', 'netlist', '--output', out, schPath], { reject: false });
+    if (res.exitCode !== 0 || !existsSync(out)) {
+      const detail = [res.stderr, res.stdout].filter(Boolean).join('\n').trim();
+      throw new Error(`kicad-cli could not export the schematic netlist: ${detail || `exit ${res.exitCode}`}`);
+    }
+    return await readFile(out, 'utf8');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 export interface FabExportResult {
   produced: string[];
   failed: { artifact: string; reason: string }[];

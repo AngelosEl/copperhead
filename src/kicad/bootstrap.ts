@@ -102,7 +102,10 @@ function projectFile(slug: string, rootUuid: string): string {
   return (
     JSON.stringify(
       {
-        board: { design_settings: { defaults: {}, rules: {} } },
+        // Stock KiCad footprints put 0.2 mm vias in QFN thermal pads; KiCad's
+        // 0.3 mm default would fail DRC on footprints the layout stage may not
+        // edit (#314). 0.2 mm is within JLCPCB's standard process.
+        board: { design_settings: { defaults: {}, rules: { min_through_hole_diameter: 0.2 } } },
         erc: {
           erc_exclusions: [],
           meta: { version: 0 },

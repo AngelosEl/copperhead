@@ -4,7 +4,11 @@ import { readFile, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { loadConfig, resolveCompatSettings } from '../config.js';
 import { bootstrapKicadProject, markCreateOrigin } from '../kicad/bootstrap.js';
-import { exportSvg, runErc } from '../kicad/cli.js';
+import { exportNetlist, exportSvg, runErc } from '../kicad/cli.js';
+import { FootprintResolver, formatMissingFootprints, missingFootprints } from '../kicad/footprints.js';
+import { boardFootprints, boardMatchesNetlist, MissingFootprintsError, parseNetlist, populateBoard } from '../kicad/populate.js';
+import { bomFootprintRows } from '../memory/bom-table.js';
+import type { MissingFootprint } from '../kicad/footprints.js';
 import { listSymbols } from '../kicad/sexp.js';
 import { checkLegibility } from '../kicad/legibility.js';
 import { draftSchematicToText, defaultIntentPath } from '../kicad/draft/draft.js';
@@ -182,10 +186,12 @@ export const STAGES: Stage[] = [
         const cols = row.split('|').map((c) => c.trim());
         const mpn = cols[4] ?? ''; // 0=empty, 1=Refdes, 2=Value, 3=Footprint, 4=MPN
         return mpn && !mpn.toUpperCase().startsWith('UNVERIFIED');
-      });
+      }) && !(await bomFootprintMisses(root, docs))?.missing.some(modelFixable);
+      // ^ every footprint resolves, except a library the user must install
+      // (that stops the run before the schematic stage, #314)
     },
     prompt: () =>
-      'Stage 3: part selection. Write docs/BOM.md with the fixed table format (| Refdes | Value | Footprint | MPN | Rationale |). The Value column holds the COMPONENT VALUE and nothing else — "4.7uF", "1M", "500mAh Li-Po", "STM32F103C8T6" — because stage 4 draws it on the sheet as that part\'s Value field, where a description ("1S Li-Po cell, 500 mAh, bare leads") collides with neighbouring symbols and fails the legibility gate. Put the prose in the Rationale column instead; that is the column for it, and nothing draws it. One row per refdes: a grouped row ("SW3-SW16", "C5-C8") is not a BOM row and the schematic stage cannot match it. Every MPN you introduce is flagged UNVERIFIED with a datasheet-verifiable justification. Check leakage/quiescent current of every part against the power budget. The design must be capturable with the KiCad symbol libraries installed on THIS machine: run search_symbols for every IC, module, connector and other active part before committing it to the BOM, and if a part has no installed symbol, pick one that has — stage 4 draws only from installed symbols, and a BOM row it cannot resolve makes the whole run unwinnable. Existence is not enough: confirm the chosen symbol with symbol_pins so the pin numbers you wire in stage 4 are real. Multi-unit symbols (gate packs, dual opamps) are fine — the engine places each unit separately under the one refdes, and net endpoints use plain package pin numbers. Run check_drift before finishing.',
+      'Stage 3: part selection. Write docs/BOM.md with the fixed table format (| Refdes | Value | Footprint | MPN | Rationale |). The Value column holds the COMPONENT VALUE and nothing else — "4.7uF", "1M", "500mAh Li-Po", "STM32F103C8T6" — because stage 4 draws it on the sheet as that part\'s Value field, where a description ("1S Li-Po cell, 500 mAh, bare leads") collides with neighbouring symbols and fails the legibility gate. Put the prose in the Rationale column instead; that is the column for it, and nothing draws it. One row per refdes: a grouped row ("SW3-SW16", "C5-C8") is not a BOM row and the schematic stage cannot match it. Every MPN you introduce is flagged UNVERIFIED with a datasheet-verifiable justification. Check leakage/quiescent current of every part against the power budget. The design must be capturable with the KiCad symbol libraries installed on THIS machine: run search_symbols for every IC, module, connector and other active part before committing it to the BOM, and if a part has no installed symbol, pick one that has — stage 4 draws only from installed symbols, and a BOM row it cannot resolve makes the whole run unwinnable. Existence is not enough: confirm the chosen symbol with symbol_pins so the pin numbers you wire in stage 4 are real. Multi-unit symbols (gate packs, dual opamps) are fine — the engine places each unit separately under the one refdes, and net endpoints use plain package pin numbers. The Footprint column holds an exact installed KiCad footprint id (Lib:Name): call check_footprints on every Footprint cell before finishing and use only ids it reports OK (it lists the closest installed ids on a miss). The board is built from exactly these ids — nothing is substituted later — and a footprint that is not installed stops the run for the user to install it. Run check_drift before finishing.',
   },
   {
     name: 'schematic',
@@ -245,18 +251,17 @@ export const STAGES: Stage[] = [
     name: 'layout-draft',
     isComplete: async (root, docs) => {
       // The LAYOUT.md marker alone is not enough: `copperhead init` scaffolds
-      // LAYOUT.md with the literal "## Draft quality" heading, so an init-ed
-      // repo would skip this stage without a single footprint placed. Require
-      // a board with at least one footprint on it as well.
+      // LAYOUT.md with the literal "## Draft quality" heading. And "a board
+      // with a footprint" was not enough either (#314): the board must carry
+      // exactly the schematic's parts, each with its schematic footprint, so
+      // an outline-only board or a partial one never passes (AC-15.38).
       const config = await loadConfig(root);
-      if (!config.board) return false;
-      const p = path.join(root, config.board);
-      if (!existsSync(p)) return false;
-      if (!(await readFile(p, 'utf8')).includes('(footprint')) return false;
+      if (!config.board || !config.schematic) return false;
+      if (!(await boardMatchesSchematic(root, config)).ok) return false;
       return docHasContent(root, path.join(docs, 'LAYOUT.md'), '## Draft quality');
     },
     prompt: () =>
-      'Stage 5: first-draft layout. Rule-driven placement written as real coordinates: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Route power and short critical nets; leave the rest as ratsnest. Every routed net must pass run_drc. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
+      'Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn; the board is DRC-clean and fully unrouted). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint\'s (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief\'s envelope. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares the board against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
   },
   {
     name: 'outputs',
@@ -327,8 +332,113 @@ async function emitJlcpcbAfterOutputs(stageName: string, opts: CreateOptions): P
  * name the finding counts by kind — the resume then starts on the actual work
  * instead of rediscovering it.
  */
+/**
+ * The board's (ref, footprint) pairs against the schematic netlist's (#314).
+ * Any failure to read either side reads as a mismatch, never as a pass.
+ */
+async function boardMatchesSchematic(
+  root: string,
+  config: CopperheadConfig,
+): Promise<{ ok: boolean; detail: string }> {
+  if (!config.board || !config.schematic) return { ok: false, detail: 'no board or schematic configured' };
+  const boardPath = path.join(root, config.board);
+  if (!existsSync(boardPath)) return { ok: false, detail: `${config.board} does not exist` };
+  try {
+    const netlist = parseNetlist(await exportNetlist(path.join(root, config.schematic)));
+    const cmp = boardMatchesNetlist(boardFootprints(await readFile(boardPath, 'utf8')), netlist.parts);
+    if (cmp.ok) return { ok: true, detail: '' };
+    const parts = [
+      cmp.missing.length && `missing ${cmp.missing.join(', ')}`,
+      cmp.extra.length && `extra ${cmp.extra.join(', ')}`,
+      cmp.changed.length && `footprint changed on ${cmp.changed.join(', ')}`,
+    ].filter(Boolean);
+    return { ok: false, detail: `the board does not match the schematic: ${parts.join('; ')}` };
+  } catch (e) {
+    return { ok: false, detail: (e as Error).message };
+  }
+}
+
+/**
+ * Before the schematic stage (AC-15.32): every BOM.md footprint must be
+ * installed. Returns the stop message, or null to proceed. A missing BOM
+ * table is left to the stage itself.
+ */
+async function bomFootprintMisses(
+  root: string,
+  docs: string,
+): Promise<{ missing: MissingFootprint[]; searched: string[] } | null> {
+  const bomPath = path.join(root, docs, 'BOM.md');
+  if (!existsSync(bomPath)) return null;
+  const rows = bomFootprintRows(await readFile(bomPath, 'utf8'));
+  if (!rows.length) return null;
+  const config = await loadConfig(root);
+  const anchor = config.board ?? config.schematic;
+  const resolver = await FootprintResolver.create({ projectDir: anchor ? path.dirname(path.join(root, anchor)) : root });
+  const missing = await missingFootprints(rows.map((r) => ({ ref: r.refdes, footprint: r.footprint })), resolver);
+  return { missing, searched: resolver.searched };
+}
+
+/**
+ * A miss the model can fix in BOM.md: a mistyped or invented name, a
+ * non-id cell, an unassigned footprint, or a library nickname whose footprint
+ * is installed under another library. A library that is simply not installed
+ * (no near match anywhere) is the user's to install, and stops the run.
+ */
+const modelFixable = (m: MissingFootprint): boolean => m.why !== 'no-library' || m.near.length > 0;
+
+async function bomFootprintStop(root: string, config: CopperheadConfig): Promise<string | null> {
+  const r = await bomFootprintMisses(root, config.docs);
+  return r?.missing.length ? formatMissingFootprints(r.missing, r.searched, 'the schematic stage') : null;
+}
+
+/**
+ * Before each layout-draft attempt (AC-15.36): put the schematic's parts on
+ * the board. Returns the stop message when the board cannot be populated
+ * faithfully, or null to run the stage. Idempotent on an already-populated
+ * board, so a retry or a resume re-checks without rewriting.
+ */
+async function populateStop(opts: CreateOptions): Promise<string | null> {
+  const config = await loadConfig(opts.repoRoot);
+  if (!config.board || !config.schematic) return 'no board or schematic is configured; the schematic stage did not scaffold one';
+  try {
+    const r = await populateBoard({ repoRoot: opts.repoRoot, schematic: config.schematic, board: config.board });
+    if (!r.unchanged) {
+      opts.log(
+        stageLine(
+          'layout-draft',
+          `placed ${r.placed.length} footprint(s) from the schematic on ${config.board} (${r.nets} nets, unrouted` +
+            `${r.outline.grown ? `; outline grown to ${r.outline.width} x ${r.outline.height} mm to fit` : ''})`,
+          'ok',
+        ),
+      );
+    }
+    return null;
+  } catch (e) {
+    if (e instanceof MissingFootprintsError) return formatMissingFootprints(e.missing, e.searched, 'the layout-draft stage');
+    return `could not put the schematic's parts on the board: ${(e as Error).message}`;
+  }
+}
+
 async function contractGapDetail(stageName: string, root: string, config: CopperheadConfig): Promise<string> {
   const generic = 'the run finished but the stage completion contract is not met — no usable artifact was produced';
+  if (stageName === 'part-selection') {
+    const r = await bomFootprintMisses(root, config.docs);
+    const fixable = r?.missing.filter(modelFixable) ?? [];
+    if (fixable.length) {
+      return (
+        `the part-selection contract is not met: ${fixable.length} BOM.md footprint(s) do not resolve to an installed footprint — ` +
+        fixable.map((m) => `${m.ref} ${m.footprint || '(none)'}${m.near.length ? ` (installed: ${m.near.slice(0, 3).join(', ')})` : ''}`).join('; ') +
+        '; call check_footprints on every Footprint cell and use exact installed ids'
+      );
+    }
+  }
+  if (stageName === 'layout-draft') {
+    const fresh = await loadConfig(root);
+    const m = await boardMatchesSchematic(root, fresh);
+    return m.ok
+      ? 'the layout-draft contract is not met: LAYOUT.md has no "## Draft quality" section'
+      : `the layout-draft contract is not met: ${m.detail}; restore the populated footprints (never add or rewrite them) and move them instead`;
+  }
   if (stageName !== 'schematic' || !config.schematic) return generic;
   const p = path.join(root, config.schematic);
   if (!existsSync(p)) return generic;
@@ -811,6 +921,17 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
       await emitJlcpcbAfterOutputs(stage.name, opts);
       continue;
     }
+    // A footprint that is not installed stops the run for the user (#314): no
+    // model turn can install a library, and a substitute package is exactly
+    // the surrogate geometry this gate exists to keep off the board.
+    const stop = stage.name === 'schematic' ? await bomFootprintStop(opts.repoRoot, config) : null;
+    if (stop) {
+      opts.log(stageLine(stage.name, `create stopped: ${stop}`, 'err'));
+      logResumePoint(opts, stage, i);
+      printCostTable(opts, stageCosts);
+      await writeRunReport(opts, stageCosts);
+      return { ok: false, completed };
+    }
     // Auto-recovery loop: run the stage, and if it fails or ends without meeting
     // its contract, ask the model to diagnose whether another attempt is likely
     // to help. On "retry" the pipeline runs the stage again (with the diagnosis's
@@ -838,6 +959,13 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
         const rescaffolded = await bootstrapKicadProject(opts.repoRoot, brief);
         if (rescaffolded && attempt > 1) {
           opts.log(stageLine('schematic', 're-scaffolded empty KiCad project after rollback, wired into config'));
+        }
+      }
+      if (stage.name === 'layout-draft') {
+        const populate = await populateStop(opts);
+        if (populate) {
+          opts.log(stageLine(stage.name, `create stopped: ${populate}`, 'err'));
+          break;
         }
       }
       opts.log(

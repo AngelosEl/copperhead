@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { emitSchematic } from '../emit.js';
 import { SymbolSource } from './symsource.js';
+import type { FootprintResolver } from '../footprints.js';
 import { parseIntent, validateIntent, formatIrFindings, INTENT_FILENAME, type IrFinding } from './ir.js';
 import { draftSchematicPlacement, type SchematicDraftReport, type NetClass, type NetClassBasis } from './engine.js';
 
@@ -23,6 +24,12 @@ export interface SchematicDraftOptions {
   symbolDirs?: string[];
   /** Stable date stamp for the title block (callers pass a fixed value in tests). */
   today?: string;
+  /**
+   * Check every part's symbol pins against its footprint's pads (#314). The
+   * agent's draft tool passes one; standalone drafts and the reference-board
+   * corpus do not, since they carry no board.
+   */
+  footprints?: FootprintResolver;
 }
 
 export type SchematicDraftResult =
@@ -59,7 +66,7 @@ export async function draftSchematicToText(opts: SchematicDraftOptions): Promise
   // docsDir may arrive repo-relative (config.docs); resolve against the repo
   const docsDir =
     opts.docsDir === undefined || opts.docsDir === null ? null : path.resolve(opts.repoRoot, opts.docsDir);
-  const { ok, findings, validated } = await validateIntent(intent, symsource, docsDir);
+  const { ok, findings, validated } = await validateIntent(intent, symsource, docsDir, opts.footprints);
   if (!ok || !validated) return { ok: false, findings, message: formatIrFindings(findings) };
 
   const projectName = path.basename(opts.schematic).replace(/\.kicad_sch$/, '');
@@ -132,13 +139,25 @@ export async function draftSchematic(opts: SchematicDraftOptions): Promise<Schem
     await writeFile(proPath, JSON.stringify(pro, null, 2) + '\n', 'utf8');
   }
   const cacheRel = path.relative(schDir, symsource.cacheDir()).split(path.sep).join('/');
-  const rows = symsource
-    .vendoredLibs()
+  const vendored = new Set(symsource.vendoredLibs());
+  // Rows the user added (a project-local vendor library, #314) survive the
+  // rewrite verbatim; only nicknames now served from the cache are replaced.
+  const tablePath = path.join(schDir, 'sym-lib-table');
+  const kept = existsSync(tablePath)
+    ? (await readFile(tablePath, 'utf8'))
+        .split('\n')
+        .filter((l) => {
+          const name = /^\s*\(lib\s+\(name\s+"([^"]+)"\)/.exec(l)?.[1];
+          return name !== undefined && !vendored.has(name) && !l.includes('copperhead vendored');
+        })
+        .map((l) => `\t${l.trim()}`)
+    : [];
+  const rows = [...vendored]
     .map(
       (lib) =>
         `\t(lib (name "${lib}")(type "KiCad")(uri "\${KIPRJMOD}/${cacheRel ? cacheRel + '/' : ''}${lib}.kicad_sym")(options "")(descr "copperhead vendored"))`,
     );
-  await writeFile(path.join(schDir, 'sym-lib-table'), `(sym_lib_table\n\t(version 7)\n${rows.join('\n')}\n)\n`, 'utf8');
+  await writeFile(path.join(schDir, 'sym-lib-table'), `(sym_lib_table\n\t(version 7)\n${[...kept, ...rows].join('\n')}\n)\n`, 'utf8');
   return res;
 }
 

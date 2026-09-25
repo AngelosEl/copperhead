@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { SymbolSource, SymbolResolutionError, powerNetToken, type ResolvedSymbol } from './symsource.js';
-import { parseBomTable, normalizeValue } from '../../memory/bom-table.js';
+import { parseBomTable, normalizeValue, normalizeFootprint, bomFootprintRows } from '../../memory/bom-table.js';
+import { footprintPadNumbers, formatPadMismatch, type FootprintResolver } from '../footprints.js';
 
 /**
  * The netlist-intent IR (`schematic.intent.json`): the compact declarative
@@ -81,9 +82,19 @@ async function headingsOf(file: string): Promise<string[] | null> {
  * verbatim and simply matches nothing, because the BOM contract is one row per
  * part — the row's single Rationale cell is where that part's purpose lives.
  */
-async function bomRowsOf(file: string): Promise<{ ref: string; value: string }[] | null> {
+async function bomRowsOf(file: string): Promise<{ ref: string; value: string; footprint: string }[] | null> {
   if (!existsSync(file)) return null;
-  const rows = parseBomTable(await readFile(file, 'utf8')).map((r) => ({ ref: r.refdes, value: r.value ?? '' }));
+  const md = await readFile(file, 'utf8');
+  // first row per refdes: the canonical BOM table leads the doc, and a later
+  // supporting table (pin assignments, costs) must not override its cells
+  const fps = new Map(bomFootprintRows(md).map((r) => [r.refdes, r.footprint]));
+  const seen = new Set<string>();
+  const rows: { ref: string; value: string; footprint: string }[] = [];
+  for (const r of parseBomTable(md)) {
+    if (seen.has(r.refdes)) continue;
+    seen.add(r.refdes);
+    rows.push({ ref: r.refdes, value: r.value ?? '', footprint: fps.get(r.refdes) ?? '' });
+  }
   return rows.length ? rows : null;
 }
 
@@ -158,6 +169,7 @@ export async function validateIntent(
   intent: SchematicIntent,
   symsource: SymbolSource,
   docsDir: string | null,
+  footprints?: FootprintResolver,
 ): Promise<{ ok: boolean; findings: IrFinding[]; validated: ValidatedIntent | null }> {
   const findings: IrFinding[] = [];
   const add = (detail: string): void => {
@@ -233,6 +245,27 @@ export async function validateIntent(
     } catch (e) {
       if (e instanceof SymbolResolutionError) add(`${p.ref}: ${e.message}`);
       else throw e;
+    }
+  }
+
+  // pins against pads (#314): a symbol pin its footprint has no pad for drops
+  // that pin's net off the board ("No pad found for pin" in KiCad). A footprint
+  // that does not resolve is the BOM gate's business, not this check's.
+  if (footprints) {
+    const byNum = (a: string, b: string): number => a.localeCompare(b, undefined, { numeric: true });
+    for (const p of partByRef.values()) {
+      const sym = symbols.get(p.ref);
+      if (!sym || sym.isPower || !p.footprint) continue;
+      const hit = await footprints.resolve(p.footprint);
+      if (!hit.ok) continue;
+      const pads = await footprintPadNumbers(hit.file);
+      const pins = [...new Set(sym.pins.map((pin) => pin.number))].filter((n) => !pads.has(n)).sort(byNum);
+      if (pins.length) {
+        add(
+          `${formatPadMismatch({ ref: p.ref, footprint: p.footprint, pins, pads: [...pads].sort(byNum) })}; ` +
+            `use a symbol whose pin numbers match the footprint's pads (or change the footprint in BOM.md and the intent together)`,
+        );
+      }
     }
   }
 
@@ -369,9 +402,21 @@ export async function validateIntent(
   const bomRows = docsDir ? await bomRowsOf(path.join(docsDir, 'BOM.md')) : null;
   if (bomRows) {
     const bomByRef = new Map(bomRows.map((r) => [r.ref, r.value]));
+    const bomFootprint = new Map(bomRows.map((r) => [r.ref, r.footprint]));
     for (const p of partByRef.values()) {
       if (symbols.get(p.ref)?.isPower) continue;
       const bomValue = bomByRef.get(p.ref);
+      // The footprint was chosen at part selection and checked installed
+      // before this stage ran (#314); the intent carries it verbatim. Another
+      // package here would reach the board unchecked, so it is refused rather
+      // than accepted as a substitute.
+      const fp = bomFootprint.get(p.ref);
+      if (bomValue !== undefined && fp && normalizeFootprint(p.footprint) !== fp) {
+        add(
+          `${p.ref} footprint ${p.footprint ? `"${p.footprint}"` : '(none)'} differs from BOM.md's "${fp}"; ` +
+            `copy the BOM footprint exactly (do not substitute another package)`,
+        );
+      }
       if (bomValue === undefined) {
         add(`${p.ref} is not a BOM.md row; add it to the BOM or drop it from the intent`);
         continue;
