@@ -32,6 +32,12 @@ type Overhang = { left: number; right: number; top: number; bottom: number };
 /** Padding, grid units, a group box keeps around the label and field text it
  * encloses, and the clearance kept between two such boxes. */
 const BOX_PAD = 1;
+/** Grid units of padding a laid-out group box keeps around its content,
+ * beside, below, and between its caption and the parts: roomier than
+ * BOX_PAD, the least a box may hold its text by while it is being fitted. */
+const BOX_INSET = 2;
+/** Half the drawn size of a no-connect cross (and a junction dot), mm. */
+const NC_HALF = 0.635;
 /** Grid units between two drawn group boxes, after the boxes have grown to
  * their text: the one distance a reader sees between blocks. Equal to
  * GROUP_GAP, the gap the wrap fits between rects, so a fit on measured
@@ -4798,9 +4804,6 @@ function draftOnce(
         bottom: (applied?.bottom ?? 0) + Math.max(0, r.y2 - before.y2),
       });
     }
-    // Boxes in one row of the wrap share a bottom edge, boxes in one column
-    // a right edge, when the neighbour's space is free anyway: a row of
-    // boxes ending at three different heights reads as three afterthoughts.
     // A line of the wrap (a row, or a column) is the set of boxes whose
     // fitted rects landed at one top (one left): the shifts that took them
     // there differ box by box, since the single-row pass gave them
@@ -4824,30 +4827,14 @@ function draftOnce(
       }
     }
     const lineOf = (i: number): number => lineIndex[i]!;
-    if (fit.wrap) {
-      const byLine = new Map<number, typeof groupRects>();
-      for (const [i, r] of groupRects.entries()) {
-        byLine.set(lineOf(i), [...(byLine.get(lineOf(i)) ?? []), r]);
-      }
-      for (const line of byLine.values()) {
-        if (line.length < 2) continue;
-        if (fit.wrap.kind === 'columns' || fit.wrap.kind === 'masonry') {
-          const right = Math.max(...line.map((r) => r.x2));
-          for (const r of line) r.x2 = right;
-        } else {
-          const bottom = Math.max(...line.map((r) => r.y2));
-          for (const r of line) r.y2 = bottom;
-        }
-      }
-    }
     // The boxes grew into the gaps the wrap left between cells, each by its
     // own text, so two boxes might nearly touch where two others stood 10 mm
     // apart, and a row's boxes started at three different heights. Every box
-    // now moves, with everything drawn in it, so that BOX_LINE_GAP separates
-    // neighbours along and across the lines of the wrap, and a row shares
-    // its top (a column its left). Content moves by whole units to keep the
-    // grid; the box takes the exact position, so its padding varies by less
-    // than a unit while the gaps do not.
+    // is now drawn tight around what it holds, with one padding, and laid on
+    // a grid of the sheet: BOX_LINE_GAP between neighbours along and across
+    // the lines of the wrap, rows sharing a top and columns a left edge.
+    // Box edges sit on the unit grid, so box and content move together by
+    // whole units and neither the padding nor the gaps drift.
     {
       const lineGap = BOX_LINE_GAP * U;
       const byLine = new Map<number, { r: (typeof groupRects)[number]; i: number }[]>();
@@ -4929,69 +4916,93 @@ function draftOnce(
         r.y2 += dy;
       };
       const snap = (d: number): number => grid(Math.round(d / U));
-      const lines = [...byLine.entries()].sort((a, b) => a[0] - b[0]).map(([, members]) => members);
-      const left0 = Math.min(...groupRects.map((r) => r.x1));
-      const top0 = Math.min(...groupRects.map((r) => r.y1));
-      // what each box was before the alignment above shared its edges
-      const ownSize = new Map(groupRects.map((r, i) => [r.name, { w: Math.max(...(boxesOf.get(r.name) ?? []).map((b) => b.maxX + BOX_PAD * U), captionBox(r).maxX + BOX_PAD * U, rectsBeforeText[i]!.x2) - r.x1, h: Math.max(...(boxesOf.get(r.name) ?? []).map((b) => b.maxY + BOX_PAD * U), rectsBeforeText[i]!.y2) - r.y1 }]));
-      if (columnar) {
-        let colLeft = left0;
-        for (const members of lines) {
-          members.sort((a, b) => a.r.y1 - b.r.y1);
-          const colW = Math.max(...members.map((m) => m.r.x2 - m.r.x1));
-          let y = top0;
-          for (const { r } of members) {
-            const h = r.y2 - r.y1;
-            moveGroup(r, snap(colLeft - r.x1), snap(y - r.y1));
-            r.x1 = colLeft;
-            r.x2 = colLeft + colW;
-            r.y1 = y;
-            r.y2 = y + h;
-            y += h + lineGap;
-          }
-          colLeft += colW + lineGap;
-        }
-      } else {
-        let rowTop = top0;
-        for (const members of lines) {
-          members.sort((a, b) => a.r.x1 - b.r.x1);
-          const rowH = Math.max(...members.map((m) => m.r.y2 - m.r.y1));
-          let x = left0;
-          for (const { r } of members) {
-            const w = r.x2 - r.x1;
-            moveGroup(r, snap(x - r.x1), snap(rowTop - r.y1));
-            r.x1 = x;
-            r.x2 = x + w;
-            r.y1 = rowTop;
-            r.y2 = rowTop + rowH;
-            x += w + lineGap;
-          }
-          rowTop += rowH + lineGap;
+      const lines = [...byLine.entries()].sort((a, b) => a[0] - b[0]).map(([, members]) => members.map((m) => m.r));
+      // measured over exactly what `moveGroup` carries, where it now stands
+      const contentOf = (name: string): Bounds[] => [
+        ...[...placed].filter(([key]) => groupOf.get(key) === name).map(([, pl]) => pl.body),
+        // a pin reaches past the body outline, and an unwired one carries its
+        // no-connect cross at the tip: both are drawn, so both are content
+        ...[...placed].filter(([key]) => groupOf.get(key) === name).flatMap(([, pl]) => pl.sym.pins.map((pin) => pinAt(pl, pin)).map((p) => ({ minX: p.x - NC_HALF, minY: p.y - NC_HALF, maxX: p.x + NC_HALF, maxY: p.y + NC_HALF }))),
+        ...[...uniqJunctions, ...noConnects].filter((it) => pointGroup.get(it) === name).map((it) => ({ minX: it.x - NC_HALF, minY: it.y - NC_HALF, maxX: it.x + NC_HALF, maxY: it.y + NC_HALF })),
+        ...emitPairs.filter(({ pl }) => groupOf.get(keyOfPlaced.get(pl) ?? '') === name).flatMap(({ sym, pl }) => [fieldBox(displayRefOf(pl), sym.refAt.x, sym.refAt.y), fieldBox(sym.value, sym.valueAt.x, sym.valueAt.y)]),
+        ...extraSymbols.filter((ps) => powerGroup.get(ps) === name).flatMap((ps) => [{ minX: ps.at.x - 2 * U, minY: ps.at.y - 2 * U, maxX: ps.at.x + 2 * U, maxY: ps.at.y + 2 * U }, ...(ps.hideValue ? [] : [powerValueBox(ps.value, ps.valueAt.x, ps.valueAt.y)])]),
+        ...labels.filter((lb) => pointGroup.get(lb) === name).map((lb) => labelReserveBox(lb.name, lb.x, lb.y, lb.rot, lb.kind)),
+        ...wires.filter((w) => wireGroup.get(w) === name).map((w) => ({ minX: Math.min(w.x1, w.x2), minY: Math.min(w.y1, w.y2), maxX: Math.max(w.x1, w.x2), maxY: Math.max(w.y1, w.y2) })),
+      ];
+      // tight: BOX_INSET beside and below the content, the caption band (its
+      // 2 mm inset, every caption line, BOX_INSET of air) above it, and wide
+      // enough for the caption; each edge out to the next grid line
+      const down = (v: number): number => grid(Math.floor(v / U + 1e-6));
+      const up = (v: number): number => grid(Math.ceil(v / U - 1e-6));
+      for (const r of groupRects) {
+        const own = contentOf(r.name);
+        if (!own.length) continue;
+        const pad = BOX_INSET * U;
+        const x1 = down(Math.min(...own.map((b) => b.minX)) - pad);
+        const y1 = down(Math.min(...own.map((b) => b.minY)) - (2 + strokeTextHeight(r.caption ?? r.name, CAPTION_SIZE) + pad));
+        const contentX2 = up(Math.max(...own.map((b) => b.maxX)) + pad);
+        const x2 = Math.max(contentX2, up(captionBox({ ...r, x1, y1 }).maxX + pad));
+        const y2 = up(Math.max(...own.map((b) => b.maxY)) + pad);
+        Object.assign(r, { x1, y1, x2, y2 });
+        // a caption wider than the parts sets the width: the parts take the
+        // middle of it, so the padding either side of them stays equal
+        const dx = grid(Math.trunc((x2 - contentX2) / 2 / U));
+        if (dx) {
+          moveGroup(r, dx, 0);
+          r.x1 -= dx;
+          r.x2 -= dx;
         }
       }
-      // A shared edge may reach where the box's own text did not: the
-      // title-block corner. The sheet pass below centres the content in the
-      // frame; predicted here the same way, any box whose aligned edge would
-      // enter the corner falls back to its own width or height there.
-      {
-        const paper = fit.paper;
-        const xs = groupRects.flatMap((r) => [r.x1, r.x2]);
-        const ys = groupRects.flatMap((r) => [r.y1, r.y2]);
-        const contentW = Math.max(...xs) - Math.min(...xs);
-        const contentH = Math.max(...ys) - Math.min(...ys);
-        const dx = grid(Math.round((FRAME + Math.max(0, (paper.w - 2 * FRAME - contentW) / 2) - Math.min(...xs)) / U));
-        const dy = grid(Math.round((FRAME + 4 * U + Math.max(0, (paper.h - 2 * FRAME - TITLE_STRIP - contentH) / 2) - Math.min(...ys)) / U));
-        const cornerX = paper.w - FRAME - TITLE_BLOCK_W - dx;
-        const cornerY = paper.h - FRAME - TITLE_STRIP - dy;
-        for (const r of groupRects) {
-          if (r.x2 <= cornerX || r.y2 <= cornerY) continue;
-          const o = ownSize.get(r.name)!;
-          const ownX2 = r.x1 + o.w;
-          const ownY2 = r.y1 + o.h;
-          // give back the aligned width first (a wide short row), then the height
-          if (ownX2 <= cornerX && r.x2 > ownX2) r.x2 = ownX2;
-          if (r.x2 > cornerX && ownY2 <= cornerY && r.y2 > ownY2) r.y2 = ownY2;
+      const left0 = Math.min(...groupRects.map((r) => r.x1));
+      const top0 = Math.min(...groupRects.map((r) => r.y1));
+      const place = (r: (typeof groupRects)[number], x: number, y: number): void => moveGroup(r, snap(x - r.x1), snap(y - r.y1));
+      if (columnar) {
+        // a column shares its left edge; its boxes stack at their own heights
+        let x = left0;
+        for (const col of lines) {
+          col.sort((a, b) => a.y1 - b.y1);
+          let y = top0;
+          for (const r of col) {
+            place(r, x, y);
+            y = r.y2 + lineGap;
+          }
+          x += Math.max(...col.map((r) => r.x2 - r.x1)) + lineGap;
         }
+      } else {
+        for (const row of lines) row.sort((a, b) => a.x1 - b.x1);
+        const rowH = lines.map((row) => Math.max(...row.map((r) => r.y2 - r.y1)));
+        const colW: number[] = [];
+        for (const row of lines) row.forEach((r, j) => (colW[j] = Math.max(colW[j] ?? 0, r.x2 - r.x1)));
+        const layOut = (asGrid: boolean): void => {
+          let y = top0;
+          lines.forEach((row, i) => {
+            let x = left0;
+            row.forEach((r, j) => {
+              place(r, x, y);
+              x += (asGrid ? colW[j]! : r.x2 - r.x1) + lineGap;
+            });
+            y += rowH[i]! + lineGap;
+          });
+        };
+        // A true grid when the rows wrap: every column one width, every row
+        // one height, so the boxes' left edges line up down the sheet. When
+        // those shared widths leave the frame, or reach the title-block
+        // corner once the sheet pass centres the content, each row packs its
+        // own boxes instead and shares only its top.
+        const gridW = colW.reduce((a, w) => a + w, 0) + lineGap * (colW.length - 1);
+        let asGrid = lines.length > 1 && gridW <= fit.paper.w - 2 * FRAME + 1e-6;
+        if (asGrid) {
+          layOut(true);
+          const paper = fit.paper;
+          const xs = groupRects.flatMap((r) => [r.x1, r.x2]);
+          const ys = groupRects.flatMap((r) => [r.y1, r.y2]);
+          const dx = grid(Math.round((FRAME + Math.max(0, (paper.w - 2 * FRAME - (Math.max(...xs) - Math.min(...xs))) / 2) - Math.min(...xs)) / U));
+          const dy = grid(Math.round((FRAME + 4 * U + Math.max(0, (paper.h - 2 * FRAME - TITLE_STRIP - (Math.max(...ys) - Math.min(...ys))) / 2) - Math.min(...ys)) / U));
+          const cornerX = paper.w - FRAME - TITLE_BLOCK_W - dx;
+          const cornerY = paper.h - FRAME - TITLE_STRIP - dy;
+          if (groupRects.some((r) => r.x2 > cornerX && r.y2 > cornerY)) asGrid = false;
+        }
+        if (!asGrid) layOut(false);
       }
     }
   }

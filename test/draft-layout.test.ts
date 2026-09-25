@@ -795,3 +795,65 @@ describe('a group box contains its caption (#307)', () => {
     expect(model.captions.map((c) => c.text).sort()).toEqual(['IO', 'Power']);
   });
 });
+
+describe('group boxes: tight, padded, on a sheet grid', () => {
+  const onGrid = (v: number): boolean => Math.abs(v / U - Math.round(v / U)) < 1e-6;
+
+  /** A ribbon whose groups differ in width (every other one gains a
+   * connector column), so rows packed box by box would not line their
+   * columns up by accident. */
+  function unevenRibbon(n: number): SchematicIntent {
+    const intent = ribbon(n);
+    for (let i = 2; i <= n; i += 2) {
+      intent.parts.push({ ref: `J${i}`, libId: 'CopperConn:Conn_01x03', value: 'Conn_01x03', group: `G${String(i).padStart(2, '0')}` });
+      intent.nets.find((net) => net.name === `SIG${i}`)!.pins.push(`J${i}.1`);
+      intent.nets.find((net) => net.name === 'GND')!.pins.push(`J${i}.2`);
+      intent.noConnect!.push(`J${i}.3`);
+    }
+    return intent;
+  }
+
+  it('lays wrapped rows out as a grid: edges on the unit grid, shared tops and lefts, even gutters', async () => {
+    const { model } = await place(unevenRibbon(8));
+    // the groups really differ in width, so a shared left edge is the grid's doing
+    expect(new Set(model.rectangles.map((r) => Math.round((r.x2 - r.x1) / U))).size).toBeGreaterThan(1);
+    const rects = model.rectangles;
+    for (const r of rects) {
+      for (const v of [r.x1, r.y1, r.x2, r.y2]) expect(onGrid(v), `${r.name} edge ${v}`).toBe(true);
+    }
+    const rows = rowsOf(rects).map((names) => names.map((n) => rects.find((r) => r.name === n)!));
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    for (const row of rows) {
+      // a row shares its top; neighbours sit at least a gutter apart
+      expect(new Set(row.map((r) => r.y1)).size).toBe(1);
+      for (let j = 1; j < row.length; j++) expect(row[j]!.x1 - row[j - 1]!.x2).toBeGreaterThanOrEqual(4 * U - 1e-6);
+    }
+    // a column shares its left edge down the sheet
+    const cols = Math.max(...rows.map((r) => r.length));
+    for (let j = 0; j < cols; j++) {
+      const lefts = rows.filter((row) => row[j]).map((row) => row[j]!.x1);
+      expect(new Set(lefts).size, `column ${j}`).toBe(1);
+    }
+    // rows sit a gutter apart
+    for (let i = 1; i < rows.length; i++) {
+      expect(Math.min(...rows[i]!.map((r) => r.y1)) - Math.max(...rows[i - 1]!.map((r) => r.y2))).toBeGreaterThanOrEqual(4 * U - 1e-6);
+    }
+  });
+
+  it('pads a box evenly: the same room left and right, two units past the widest drawn item', async () => {
+    const { model } = await place(ribbon(4));
+    for (const r of model.rectangles) {
+      const pts = [
+        ...model.wires.flatMap((w) => [[w.x1, w.y1], [w.x2, w.y2]]),
+        ...model.noConnects.map((n) => [n.x, n.y]),
+        ...model.labels.map((l) => [l.x, l.y]),
+        ...model.symbols.map((sym) => [sym.at.x, sym.at.y]),
+      ].filter(([x, y]) => x! >= r.x1 && x! <= r.x2 && y! >= r.y1 && y! <= r.y2);
+      const left = Math.min(...pts.map(([x]) => x! - r.x1));
+      const right = Math.min(...pts.map(([x]) => r.x2 - x!));
+      expect(left, r.name).toBeCloseTo(right, 6);
+      // the MCU8's side labels reach 5.08 mm past these points; BOX_INSET adds 2.54
+      expect(left, r.name).toBeGreaterThanOrEqual(7.62 - 1e-6);
+    }
+  });
+});
