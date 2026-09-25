@@ -49,6 +49,8 @@ const WIDEST = Math.max(...ADVANCE);
 const ALIGN_PAD = 0.2636;
 /** Half the bold pen (KiCad draws bold at a pen of h / 5). */
 const HALF_BOLD_PEN = 0.1;
+/** Top-to-top distance of the lines of multi-line text, per height (1.61 at every size, bold or not). */
+export const LINE_PITCH = 1.61;
 /** Regular text sits up to 0.112 h to one side of where bold sits; the
  * table is bold, so both sides get this much slack and one extent covers
  * either weight. */
@@ -88,4 +90,26 @@ export function strokeTextExtent(text: string, h: number, justify: 'left' | 'cen
   if (minX === Infinity) return { minX: 0, maxX: 0 };
   const pad = HALF_BOLD_PEN + WEIGHT_SLACK;
   return { minX: (minX - pad) * h, maxX: (maxX + pad) * h };
+}
+
+/** Height of the glyph cells `text` occupies: `h` per line, lines `LINE_PITCH * h` apart. */
+export function strokeTextHeight(text: string, h: number): number {
+  return h * (1 + (text.split('\n').length - 1) * LINE_PITCH);
+}
+
+/**
+ * `text` broken at one space into two lines, at the space whose wider line is
+ * the narrowest (ties: the earlier space), or null when it has no space to
+ * break at. Left-justified, so the widths are the lines' ink extents.
+ */
+export function wrapTwoLines(text: string, h: number): string | null {
+  let best: { text: string; w: number } | null = null;
+  for (let i = text.indexOf(' '); i >= 0; i = text.indexOf(' ', i + 1)) {
+    const a = text.slice(0, i).trimEnd();
+    const b = text.slice(i + 1).trimStart();
+    if (!a || !b) continue;
+    const w = Math.max(strokeTextExtent(a, h, 'left').maxX, strokeTextExtent(b, h, 'left').maxX);
+    if (!best || w < best.w - 1e-9) best = { text: `${a}\n${b}`, w };
+  }
+  return best?.text ?? null;
 }

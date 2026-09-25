@@ -1,6 +1,6 @@
 import type { Bounds } from '../sexp.js';
 import { knum, CAPTION_SIZE, type PlacementModel, type EmitSymbol, type EmitLabel, type LabelShape } from '../emit.js';
-import { strokeTextExtent } from '../strokefont.js';
+import { strokeTextExtent, strokeTextHeight, wrapTwoLines } from '../strokefont.js';
 import { powerSymbolSource, pwrFlagSource, type ResolvedSymbol, type DraftPin } from './symsource.js';
 import type { SchematicIntent, IntentNet, IntentPart, ValidatedIntent } from './ir.js';
 
@@ -85,10 +85,12 @@ const trace = (msg: string): void => {
 const labelReserveBox = (name: string, x: number, y: number, rot: number, kind: EmitLabel['kind'] = 'local'): Bounds =>
   labelBoxAt(name, x, y, rot, kind, TEXT_RESERVE);
 /** A group caption as `emit.ts` writes it (bold, left-top, 2 mm in from the
- * box corner) and the checker measures it: to the edge of its ink. */
-const captionBox = (r: { name: string; x1: number; y1: number }): Bounds => {
-  const ink = strokeTextExtent(r.name, CAPTION_SIZE, 'left');
-  return { minX: r.x1 + 2 + ink.minX, minY: r.y1 + 2, maxX: r.x1 + 2 + ink.maxX, maxY: r.y1 + 2 + CAPTION_SIZE };
+ * box corner) and the checker measures it: to the edge of its ink, over
+ * every line of a wrapped caption. */
+const captionBox = (r: { name: string; caption?: string; x1: number; y1: number }): Bounds => {
+  const text = r.caption ?? r.name;
+  const ink = strokeTextExtent(text, CAPTION_SIZE, 'left');
+  return { minX: r.x1 + 2 + ink.minX, minY: r.y1 + 2, maxX: r.x1 + 2 + ink.maxX, maxY: r.y1 + 2 + strokeTextHeight(text, CAPTION_SIZE) };
 };
 /**
  * Along-axis length a global label's flag adds beyond its text: the margin
@@ -1113,7 +1115,8 @@ function draftOnce(
 
   // ---------- in-group placement: layering + barycenter, integer grid ----------
   const placed = new Map<string, Placed>();
-  const groupRects: { name: string; x1: number; y1: number; x2: number; y2: number }[] = [];
+  /** `caption`: the group's name as drawn, when wrapped onto two lines. */
+  const groupRects: { name: string; caption?: string; x1: number; y1: number; x2: number; y2: number }[] = [];
   const groupOf = new Map<string, string>();
   /** Part key -> the anchor it was hung on or laid beside. A bound part is
    * wired to its anchor whatever the distance: the shelf placed it there
@@ -4766,15 +4769,22 @@ function draftOnce(
         r.y2 = Math.max(r.y2, b.maxY + BOX_PAD * U);
       }
       // and its caption, to the edge of its ink: the checker gates on a
-      // caption leaving its box, so a long name over a narrow group widens
-      // the group (#307). Width only: the caption band above is its height.
+      // caption leaving its box (#307). A caption wider than the box its
+      // contents need wraps onto a second line at the space that leaves the
+      // narrowest box, when that is narrower than one line; the box then
+      // widens to whatever the caption still needs (a single long word, or
+      // two lines still wider than the contents).
+      if (captionBox(r).maxX + BOX_PAD * U > r.x2) {
+        const two = wrapTwoLines(r.name, CAPTION_SIZE);
+        if (two && captionBox({ ...r, caption: two }).maxX < captionBox(r).maxX) r.caption = two;
+      }
       r.x2 = Math.max(r.x2, captionBox(r).maxX + BOX_PAD * U);
       // The caption is a band across the top of the box, not a corner the
       // parts may rise into: nothing drawn starts above the caption's
       // bottom plus a unit of air, whatever its column (a rail name beside
       // the caption read as part of it).
       const contentTop = Math.min(...(boxesOf.get(r.name) ?? []).map((b) => b.minY));
-      if (Number.isFinite(contentTop)) r.y1 = Math.min(r.y1, contentTop - (2 + CAPTION_SIZE + U));
+      if (Number.isFinite(contentTop)) r.y1 = Math.min(r.y1, contentTop - (2 + strokeTextHeight(r.caption ?? r.name, CAPTION_SIZE) + U));
       r.y1 = grid(Math.floor(r.y1 / U));
     }
     // measured before the boxes are aligned: alignment is a choice, not text
@@ -5250,7 +5260,7 @@ function draftOnce(
     labels,
     noConnects,
     rectangles: groupRects.map((r) => ({ x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, stroke: 'solid' as const, name: r.name })),
-    captions: groupRects.map((r) => ({ text: r.name, x: r.x1 + 2, y: r.y1 + 2, name: r.name })),
+    captions: groupRects.map((r) => ({ text: r.caption ?? r.name, x: r.x1 + 2, y: r.y1 + 2, name: r.name })),
     netColors: netColorsOf(intent.nets, netClasses),
   };
 

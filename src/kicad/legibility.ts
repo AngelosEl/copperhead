@@ -13,7 +13,7 @@ import {
   type WireSeg,
   type PlacedSymbolGeom,
 } from './sexp.js';
-import { strokeTextExtent } from './strokefont.js';
+import { strokeTextExtent, strokeTextHeight } from './strokefont.js';
 import type { LegibilityUserConfig } from '../config.js';
 
 /**
@@ -213,19 +213,21 @@ function textBounds(t: {
  * A group caption's box, measured to CONTAIN its ink (strokefont.ts) where
  * `textBounds` is short on purpose (design C3): the caption-overflow check
  * asks whether the caption stays inside its group, and a short box let a
- * caption drawn 22 mm past its group's edge pass as clean (#307). Vertical
- * placement is `textBounds`'s; a rotated caption keeps its centred box at the
- * contained width.
+ * caption drawn 22 mm past its group's edge pass as clean (#307). A wrapped
+ * caption is as wide as its widest line and one line pitch taller per extra
+ * line; a rotated caption keeps its centred box at the contained width.
  */
 function captionBounds(t: TextItem): Bounds {
   const e = strokeTextExtent(t.text, t.height, t.justifyH ?? 'center');
-  const box = textBounds(t);
   if (Math.abs(t.rot % 180) === 90) {
+    const box = textBounds(t);
     const w = e.maxX - e.minX;
     const cy = (box.minY + box.maxY) / 2;
     return { minX: box.minX, maxX: box.maxX, minY: cy - w / 2, maxY: cy + w / 2 };
   }
-  return { minX: t.x + e.minX, maxX: t.x + e.maxX, minY: box.minY, maxY: box.maxY };
+  const bh = strokeTextHeight(t.text, t.height);
+  const minY = t.justifyV === 'top' ? t.y : t.justifyV === 'bottom' ? t.y - bh : t.y - bh / 2;
+  return { minX: t.x + e.minX, maxX: t.x + e.maxX, minY, maxY: minY + bh };
 }
 
 /**
@@ -460,7 +462,8 @@ function checkSheet(
     const cap = sheet.texts.find(
       (t) => !t.hidden && t.text && pointIn(t.x, t.y, bounds) && t.y <= bounds.minY + band,
     );
-    const caption = cap?.text ?? null;
+    // a wrapped caption names its group across its lines
+    const caption = cap ? cap.text.replace(/\s+/g, ' ').trim() : null;
     return { rect, bounds, caption, capItem: cap, label: caption ?? `group#${i + 1}` };
   });
 

@@ -734,38 +734,64 @@ describe('label nudging keeps a stub label attached and clear', () => {
 });
 
 describe('a group box contains its caption (#307)', () => {
-  it('widens a one-part group under a long caption so the drafted sheet has no caption overflow', async () => {
-    const LONG = 'Mechanical connector and mounting holes';
-    const intent: SchematicIntent = {
-      version: 1,
-      parts: [
-        { ref: 'R1', libId: 'Device:R', value: '10k', group: LONG },
-        { ref: 'R2', libId: 'Device:R', value: '10k', group: 'IO' },
-      ],
-      nets: [{ name: 'SIG', pins: ['R1.1', 'R2.1'] }, { name: 'OUT', pins: ['R1.2', 'R2.2'] }],
-      noConnect: [],
-    };
-    const { model } = await place(intent);
-    const rect = model.rectangles.find((r) => r.name === LONG)!;
-    const cap = model.captions.find((c) => c.name === LONG)!;
-    const ink = strokeTextExtent(cap.text, CAPTION_SIZE, 'left');
-    // a lone resistor cell is ~10 mm wide; the caption's ink is ~130 mm
-    expect(cap.x + ink.maxX).toBeLessThanOrEqual(rect.x2);
-    expect(cap.x + ink.minX).toBeGreaterThanOrEqual(rect.x1);
+  /** A one-resistor group under `caption` beside a one-resistor "IO" group. */
+  const captionIntent = (caption: string): SchematicIntent => ({
+    version: 1,
+    parts: [
+      { ref: 'R1', libId: 'Device:R', value: '10k', group: caption },
+      { ref: 'R2', libId: 'Device:R', value: '10k', group: 'IO' },
+    ],
+    nets: [{ name: 'SIG', pins: ['R1.1', 'R2.1'] }, { name: 'OUT', pins: ['R1.2', 'R2.2'] }],
+    noConnect: [],
+  });
 
+  /** Place `caption`'s group and draft the sheet; the legibility report checks the caption names too. */
+  async function draftCaption(caption: string) {
+    const intent = captionIntent(caption);
+    const { model } = await place(intent);
+    const rect = model.rectangles.find((r) => r.name === caption)!;
+    const cap = model.captions.find((c) => c.name === caption)!;
     const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-caption-'));
     try {
       await mkdir(path.join(repo, 'docs'), { recursive: true });
-      await writeFile(path.join(repo, 'docs', 'SUBSYSTEMS.md'), `# Subsystems\n\n## ${LONG}\n\nConnector.\n\n## IO\n\nIO.\n`, 'utf8');
+      await writeFile(path.join(repo, 'docs', 'SUBSYSTEMS.md'), `# Subsystems\n\n## ${caption}\n\nConnector.\n\n## IO\n\nIO.\n`, 'utf8');
       await writeFile(path.join(repo, 'schematic.intent.json'), JSON.stringify(intent, null, 2), 'utf8');
       const res = await draftSchematic({ repoRoot: repo, schematic: 'board.kicad_sch', docsDir: 'docs', symbolDirs: [SYMLIB] });
       expect(res.ok, res.ok ? '' : res.message).toBe(true);
-      if (!res.ok) return;
-      const leg = await checkLegibility(res.schematicPath, { docsDir: path.join(repo, 'docs') });
-      expect(leg.findings.filter((f) => /past its group rectangle/.test(f.detail))).toEqual([]);
-      expect(leg.findings.filter((f) => f.severity === 'error')).toEqual([]);
+      const leg = res.ok ? await checkLegibility(res.schematicPath, { docsDir: path.join(repo, 'docs') }) : null;
+      const text = res.ok ? await readFile(res.schematicPath, 'utf8') : '';
+      return { model, rect, cap, leg: leg!, text };
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
+  }
+
+  it('wraps a long caption onto two lines over a narrow group, and the box holds both', async () => {
+    const LONG = 'Mechanical connector and mounting holes';
+    const { rect, cap, leg, text } = await draftCaption(LONG);
+    expect(cap.text).toBe('Mechanical connector\nand mounting holes');
+    // written as KiCad's escaped newline, never a raw line break inside the string
+    expect(text).toContain('(text "Mechanical connector\\nand mounting holes"');
+    const ink = strokeTextExtent(cap.text, CAPTION_SIZE, 'left');
+    expect(cap.x + ink.minX).toBeGreaterThanOrEqual(rect.x1);
+    expect(cap.x + ink.maxX).toBeLessThanOrEqual(rect.x2);
+    // narrower than the one-line caption would have needed (~114 mm of ink)
+    expect(rect.x2 - rect.x1).toBeLessThan(strokeTextExtent(LONG, CAPTION_SIZE, 'left').maxX);
+    // the wrapped caption still names its documented subsystem, its second
+    // line collides with nothing, and nothing leaves its box
+    expect(leg.findings.filter((f) => f.severity === 'error')).toEqual([]);
   }, 60000);
+
+  it('widens instead when the caption has no space to wrap at', async () => {
+    const WORD = 'MechanicalConnectorAndMountingHoles';
+    const { rect, cap, leg } = await draftCaption(WORD);
+    expect(cap.text).toBe(WORD);
+    expect(cap.x + strokeTextExtent(WORD, CAPTION_SIZE, 'left').maxX).toBeLessThanOrEqual(rect.x2);
+    expect(leg.findings.filter((f) => f.severity === 'error')).toEqual([]);
+  }, 60000);
+
+  it('leaves a caption that fits on one line alone', async () => {
+    const { model } = await place(captionIntent('Power'));
+    expect(model.captions.map((c) => c.text).sort()).toEqual(['IO', 'Power']);
+  });
 });

@@ -414,4 +414,57 @@ describe('group captions are measured to their ink (#307)', () => {
       await cleanup();
     }
   });
+
+  it('a caption wrapped onto two lines still names its documented subsystem', async () => {
+    // the only documented name is "Power supply": the caption matches it only
+    // when its line break reads as the space it replaced
+    const docs = await mkdtemp(path.join(tmpdir(), 'copperhead-legibility-docs-'));
+    await writeFile(path.join(docs, 'SUBSYSTEMS.md'), '# Subsystems\n\n## Power supply\n\nRails.\n', 'utf8');
+    await writeFile(path.join(docs, 'BOM.md'), '# BOM\n\n## Rails\n\n| Refdes | Value | Footprint | MPN | Rationale |\n| --- | --- | --- | --- | --- |\n| R1 | 10k |  | UNVERIFIED | fixture |\n', 'utf8');
+    const body = `
+      (rectangle (start 20 20) (end 80 60) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
+      (text "Power\\nsupply" (at 22 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      ${symR('R1', 50, 45)}
+    `;
+    const { file, cleanup } = await inTemp(sch(body));
+    try {
+      const report = await checkLegibility(file, { docsDir: docs });
+      expect(report.skipped).toEqual([]);
+      expect(report.findings.filter((x) => x.kind === 'unlabeled-group')).toEqual([]);
+    } finally {
+      await cleanup();
+      await rm(docs, { recursive: true, force: true });
+    }
+  });
+
+  it('measures a wrapped caption by its widest line: a long second line overflows', async () => {
+    const body = `
+      (rectangle (start 20 20) (end 50 60) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
+      (text "Power\\nWWWWWWWWW" (at 22 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      ${symR('R1', 30, 45)}
+    `;
+    const { file, cleanup } = await inTemp(sch(body));
+    try {
+      const report = await checkLegibility(file, {});
+      expect(report.findings.some((x) => /runs [\d.]+mm past its group rectangle's right edge/.test(x.detail))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('measures a wrapped caption one line pitch taller per line: a second line on a part collides', async () => {
+    // one line (22..25.5) clears R1's body (31.46..36.54); the third line (33.3..36.8) does not
+    const body = `
+      (rectangle (start 20 20) (end 80 60) (stroke (width 0.152) (type solid)) (fill (type none)) (uuid "aaaa0000-0000-4000-8000-00000000r001"))
+      (text "Power\\nsupply\\nrail" (at 22 22 0) (effects (font (size 3.5 3.5) bold) (justify left top)) (uuid "aaaa0000-0000-4000-8000-00000000t001"))
+      ${symR('R1', 25, 34)}
+    `;
+    const { file, cleanup } = await inTemp(sch(body));
+    try {
+      const report = await checkLegibility(file, {});
+      expect(report.findings.some((x) => x.kind === 'text-collision' && /overlaps the body of R1/.test(x.detail))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
 });

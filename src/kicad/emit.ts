@@ -33,7 +33,7 @@ export const knum = (n: number): string => {
   return Object.is(r, -0) ? '0' : String(r);
 };
 
-const q = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+const q = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
 
 export interface EmitSymbol {
   ref: string;
