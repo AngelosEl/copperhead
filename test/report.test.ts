@@ -85,4 +85,33 @@ describe('findings inside one library footprint (#314)', () => {
     expect(track.ok).toBe(false);
     expect(track.intrinsic).toEqual([]);
   });
+
+  it('never excuse two nets meeting inside one footprint: a short there is an electrical fault', () => {
+    // two schematic nets wired onto coincident pads of one stock connector
+    const short = normalizeReport({ violations: [v('shorting_items', 'Pad A4 [VCC] of J1 on F.Cu', 'Pad B9 [GND] of J1 on F.Cu')] }, 'drc');
+    expect(short.ok).toBe(false);
+    expect(short.violations.map((x) => x.type)).toEqual(['shorting_items']);
+    expect(short.intrinsic).toEqual([]);
+    const clearance = normalizeReport({ violations: [v('clearance', 'Pad 1 [VCC] of U1 on F.Cu', 'Pad 2 [GND] of U1 on F.Cu')] }, 'drc');
+    expect(clearance.ok).toBe(false);
+    // one named net against an unconnected pad is still the library's own geometry
+    const lone = normalizeReport({ violations: [v('clearance', 'Pad 1 [VCC] of U1 on F.Cu', 'Pad 2 [<no net>] of U1 on F.Cu')] }, 'drc');
+    expect(lone.ok).toBe(true);
+  });
+
+  it('never excuse a footprint KiCad cannot check against its library', () => {
+    // no library found (lib_footprint_issues) is as unvouched as a modified one
+    const r = normalizeReport(
+      {
+        violations: [
+          v('lib_footprint_issues', 'Footprint J1'),
+          v('hole_clearance', 'Pad A1 [GND] of J1 on F.Cu', 'NPTH pad of J1'),
+        ],
+      },
+      'drc',
+    );
+    expect(r.ok).toBe(false);
+    expect(r.intrinsic).toEqual([]);
+    expect(r.violations.map((x) => x.type)).toEqual(['lib_footprint_issues', 'hole_clearance']);
+  });
 });

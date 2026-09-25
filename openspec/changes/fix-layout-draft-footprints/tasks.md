@@ -65,3 +65,16 @@
 ## 10. Spec
 
 - [x] 10.1 SPEC.md: pipeline diagram, the one stop, the populate bullet, AC-15.29 – AC-15.38; AC-15.23/24's layout-draft clause marked superseded
+
+## 11. Review fixes (PR 319)
+
+- [x] 11.1 `normalizeReport` never excuses a finding that puts two nets against each other, or one inside a footprint with `lib_footprint_issues`; tests for a short and a clearance across nets inside one footprint
+- [x] 11.2 Layout-draft keeps the pre-stage board: restores it before each retry and on every unsuccessful exit; populate's board must pass DRC before the first turn (naming a missing global `fp-lib-table`); the run gets the board as `preTouched`; pipeline tests for each
+- [x] 11.3 `run_drc` in an agent run fails when unrouted connections rise above the run's starting board (`unrouted_increase`); `check` keeps counting them
+- [x] 11.4 Layout-draft completion and populate's idempotence compare pad nets with the schematic netlist
+- [x] 11.5 Drafting keeps user `sym-lib-table` rows as whole source spans (`src/kicad/spans.ts`) and refuses an unparseable table; `SymbolSource` reads the table beside the schematic
+- [x] 11.6 Library tables expand `${KICADn_3RD_PARTY}` and `kicad_common.json` variables
+- [x] 11.7 Populate accepts KiCad 5 `(module …)` files, sorts locale-independently, and bounds the pack by an outline it cannot grow
+- [x] 11.8 Scaffold `.kicad_dru` holds board vias to a 0.3 mm drill
+- [x] 11.9 Test fixtures use real footprint ids; `check`'s DRC keys updated; DRC tests run against a seeded KiCad config, not the machine's
+- [x] 11.10 SPEC.md AC-15.30/31/36–44 and the populate bullet; delta specs; design.md

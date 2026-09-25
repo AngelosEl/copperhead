@@ -24,6 +24,14 @@ export interface RunContext {
   decisions: string[];
   lastErc: CheckReport | null;
   lastDrc: CheckReport | null;
+  /**
+   * The board's text when the run started (null: no board then). An agent
+   * run may leave nets unrouted, but never more than it started with: a
+   * rise means it broke a connection (AC-15.39).
+   */
+  boardAtStart?: string | null;
+  /** Unrouted connections on `boardAtStart`, computed on the first run_drc. */
+  unroutedBaseline?: number;
   /** Last check_legibility counts; feeds the run summary's verification section. */
   lastLegibility: { error: number; advisory: number } | null;
   /** Last score composite (AC-16.21); recorded in the run summary. */

@@ -4,9 +4,17 @@ import { readFile, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { loadConfig, resolveCompatSettings } from '../config.js';
 import { bootstrapKicadProject, markCreateOrigin } from '../kicad/bootstrap.js';
-import { exportNetlist, exportSvg, runErc } from '../kicad/cli.js';
+import { exportNetlist, exportSvg, runDrc, runErc } from '../kicad/cli.js';
 import { FootprintResolver, formatMissingFootprints, missingFootprints } from '../kicad/footprints.js';
-import { boardFootprints, boardMatchesNetlist, MissingFootprintsError, parseNetlist, populateBoard } from '../kicad/populate.js';
+import {
+  boardFootprints,
+  boardMatchesNetlist,
+  MissingFootprintsError,
+  padNetMismatches,
+  parseNetlist,
+  populateBoard,
+} from '../kicad/populate.js';
+import { formatViolations } from '../kicad/report.js';
 import { bomFootprintRows } from '../memory/bom-table.js';
 import type { MissingFootprint } from '../kicad/footprints.js';
 import { listSymbols } from '../kicad/sexp.js';
@@ -261,7 +269,7 @@ export const STAGES: Stage[] = [
       return docHasContent(root, path.join(docs, 'LAYOUT.md'), '## Draft quality');
     },
     prompt: () =>
-      'Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn; the board is DRC-clean and fully unrouted). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint\'s (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief\'s envelope. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares the board against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
+      'Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn and verified it with DRC; the board is DRC-clean and fully unrouted). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint\'s (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief\'s envelope. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares every footprint and pad net against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed, but a run that ends with more unrouted connections than the board started with fails, since that means a connection was broken — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. The populated board counts as this stage\'s edit, so finishing needs a clean run_drc, run_erc, and check_drift even if you move nothing. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
   },
   {
     name: 'outputs',
@@ -333,8 +341,9 @@ async function emitJlcpcbAfterOutputs(stageName: string, opts: CreateOptions): P
  * instead of rediscovering it.
  */
 /**
- * The board's (ref, footprint) pairs against the schematic netlist's (#314).
- * Any failure to read either side reads as a mismatch, never as a pass.
+ * The board against the schematic netlist (#314): the same (ref, footprint)
+ * pairs, and every pad on the schematic's net (AC-15.38). Any failure to read
+ * either side reads as a mismatch, never as a pass.
  */
 async function boardMatchesSchematic(
   root: string,
@@ -345,12 +354,15 @@ async function boardMatchesSchematic(
   if (!existsSync(boardPath)) return { ok: false, detail: `${config.board} does not exist` };
   try {
     const netlist = parseNetlist(await exportNetlist(path.join(root, config.schematic)));
-    const cmp = boardMatchesNetlist(boardFootprints(await readFile(boardPath, 'utf8')), netlist.parts);
-    if (cmp.ok) return { ok: true, detail: '' };
+    const boardText = await readFile(boardPath, 'utf8');
+    const cmp = boardMatchesNetlist(boardFootprints(boardText), netlist.parts);
+    const nets = cmp.ok ? padNetMismatches(boardText, netlist) : [];
+    if (cmp.ok && !nets.length) return { ok: true, detail: '' };
     const parts = [
       cmp.missing.length && `missing ${cmp.missing.join(', ')}`,
       cmp.extra.length && `extra ${cmp.extra.join(', ')}`,
       cmp.changed.length && `footprint changed on ${cmp.changed.join(', ')}`,
+      nets.length && `pad nets differ on ${nets.slice(0, 8).join(', ')}${nets.length > 8 ? ', …' : ''}`,
     ].filter(Boolean);
     return { ok: false, detail: `the board does not match the schematic: ${parts.join('; ')}` };
   } catch (e) {
@@ -395,24 +407,36 @@ async function bomFootprintStop(root: string, config: CopperheadConfig): Promise
  * Before each layout-draft attempt (AC-15.36): put the schematic's parts on
  * the board. Returns the stop message when the board cannot be populated
  * faithfully, or null to run the stage. Idempotent on an already-populated
- * board, so a retry or a resume re-checks without rewriting.
+ * board, so a retry or a resume re-checks without rewriting. A board this
+ * step wrote must pass DRC before the agent's first turn (AC-15.43): the
+ * agent may move parts but not repair footprints, so a populated board that
+ * fails is a stop, not a task. The caller restores the pre-stage board.
  */
 async function populateStop(opts: CreateOptions): Promise<string | null> {
   const config = await loadConfig(opts.repoRoot);
   if (!config.board || !config.schematic) return 'no board or schematic is configured; the schematic stage did not scaffold one';
   try {
     const r = await populateBoard({ repoRoot: opts.repoRoot, schematic: config.schematic, board: config.board });
-    if (!r.unchanged) {
-      opts.log(
-        stageLine(
-          'layout-draft',
-          `placed ${r.placed.length} footprint(s) from the schematic on ${config.board} (${r.nets} nets, unrouted` +
-            `${r.outline.grown ? `; outline grown to ${r.outline.width} x ${r.outline.height} mm to fit` : ''})`,
-          'ok',
-        ),
-      );
-    }
-    return null;
+    if (r.unchanged) return null;
+    opts.log(
+      stageLine(
+        'layout-draft',
+        `placed ${r.placed.length} footprint(s) from the schematic on ${config.board} (${r.nets} nets, unrouted` +
+          `${r.outline.grown ? `; outline grown to ${r.outline.width} x ${r.outline.height} mm to fit` : ''})`,
+        'ok',
+      ),
+    );
+    const drc = await runDrc(path.join(opts.repoRoot, config.board));
+    if (drc.ok) return null;
+    // KiCad resolves footprints through its library tables only; copperhead
+    // also finds the stock install without one, so a machine with no global
+    // fp-lib-table (a fresh headless install) populates fine and then fails
+    // here on every part
+    const unlisted = drc.violations.some((v) => v.type === 'lib_footprint_issues')
+      ? '\nKiCad cannot find the footprint libraries these parts come from: this machine has no global fp-lib-table. ' +
+        "Copy KiCad's default table (the template/fp-lib-table file in KiCad's install) into your KiCad config folder, then re-run."
+      : '';
+    return `the populated board fails DRC before any placement, so ${config.board} was restored:\n${formatViolations(drc)}${unlisted}`;
   } catch (e) {
     if (e instanceof MissingFootprintsError) return formatMissingFootprints(e.missing, e.searched, 'the layout-draft stage');
     return `could not put the schematic's parts on the board: ${(e as Error).message}`;
@@ -947,146 +971,166 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
     // retry to complete shows its true total in the summary (5.2).
     const stageStart = Date.now();
     const cost: StageCost = { name: stage.name, resumed: false, wallMs: 0, turns: 0, tokensIn: 0, tokensOut: 0, cacheHits: 0 };
-    for (let attempt = 1; ; attempt++) {
-      // Re-scaffold before every attempt, not just once per stage. A previous
-      // attempt that failed at the commit gate rolls the tree back
-      // (restore(): `git reset --hard` + `git clean -fd`), which deletes the
-      // still-untracked scaffold (config.json + the empty KiCad files). Without
-      // this the retry would run against a missing schematic and cascade into a
-      // worse failure than the one being recovered from. Idempotent: a no-op
-      // whenever the project already exists.
-      if (stage.name === 'schematic') {
-        const rescaffolded = await bootstrapKicadProject(opts.repoRoot, brief);
-        if (rescaffolded && attempt > 1) {
-          opts.log(stageLine('schematic', 're-scaffolded empty KiCad project after rollback, wired into config'));
-        }
-      }
-      if (stage.name === 'layout-draft') {
-        const populate = await populateStop(opts);
-        if (populate) {
-          opts.log(stageLine(stage.name, `create stopped: ${populate}`, 'err'));
-          break;
-        }
-      }
-      opts.log(
-        stageLine(
-          stage.name,
-          `running${attempt > 1 ? ` (attempt ${attempt}/${config.maxStageRetries + 1})` : ''}`,
-        ),
-      );
-      // The BOM freezes before this stage, so every part's real pins are
-      // computable before the first turn — recomputed per attempt, since a
-      // rolled-back retry can run against a different BOM than its
-      // predecessor. Advisory only: any failure degrades to no block.
-      let dossierBlock = '';
-      if (stage.name === 'schematic') {
-        try {
-          const bomPath = path.join(opts.repoRoot, config.docs, 'BOM.md');
-          if (existsSync(bomPath)) {
-            // Bounded: a slow or wedged library scan must delay the stage by a
-            // fixed cost at most — on timeout the stage simply runs dossier-less.
-            const dossier = await withTimeout(
-              async () => bomSymbolDossier(await readFile(bomPath, 'utf8'), await symbolSearchDirs()),
-              60_000,
-            );
-            if (dossier) {
-              dossierBlock =
-                '\n\n## Installed-symbol pin dossier (machine-verified)\nEach BOM part resolved against the KiCad libraries installed on THIS machine: the top name-match lib_id and its REAL pins (number=name/electrical-type). Confirm the match fits the BOM part; alternatives are listed. Passives (R/C/L) draw from their canonical Device symbols and are omitted. Use these pins for REF.PIN endpoints instead of reading .kicad_sym files; for any part not listed, call symbol_pins.\n' +
-                dossier;
-            }
+    // Layout-draft writes the board before the agent runs (populate), outside
+    // the run's own snapshot, so the stage keeps the pre-stage board itself:
+    // every attempt starts from it, and a stage that does not complete (a
+    // stop, an abort, exhausted retries, a thrown error) puts it back, so no
+    // unverified board mutation outlives the stage (AC-15.43).
+    const layoutBoard = stage.name === 'layout-draft' ? (await loadConfig(opts.repoRoot)).board : undefined;
+    const boardBefore = layoutBoard ? await readFile(path.join(opts.repoRoot, layoutBoard), 'utf8').catch(() => null) : null;
+    const restoreBoard = async (): Promise<void> => {
+      if (layoutBoard && boardBefore !== null) await writeFile(path.join(opts.repoRoot, layoutBoard), boardBefore, 'utf8');
+    };
+    try {
+      for (let attempt = 1; ; attempt++) {
+        // Re-scaffold before every attempt, not just once per stage. A previous
+        // attempt that failed at the commit gate rolls the tree back
+        // (restore(): `git reset --hard` + `git clean -fd`), which deletes the
+        // still-untracked scaffold (config.json + the empty KiCad files). Without
+        // this the retry would run against a missing schematic and cascade into a
+        // worse failure than the one being recovered from. Idempotent: a no-op
+        // whenever the project already exists.
+        if (stage.name === 'schematic') {
+          const rescaffolded = await bootstrapKicadProject(opts.repoRoot, brief);
+          if (rescaffolded && attempt > 1) {
+            opts.log(stageLine('schematic', 're-scaffolded empty KiCad project after rollback, wired into config'));
           }
-        } catch {
-          // the dossier is context, never a gate — the stage runs without it
         }
-      }
-      const res = await runAgentLoop({
-        repoRoot: opts.repoRoot,
-        model: opts.model,
-        request: `create pipeline stage: ${stage.name}`,
-        stagePrompt: guidance
-          ? `${basePrompt}${dossierBlock}\n\n## Recovery guidance (a previous attempt did not complete this stage — do this differently)\n${guidance}`
-          : `${basePrompt}${dossierBlock}`,
-        interactive: opts.interactive ?? false,
-        allowDirty: true, // stages build on each other's uncommitted state within the pipeline
-        ...(stageTurns !== undefined ? { maxTurns: stageTurns } : {}),
-        ...(opts.onBudgetExhausted ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
-        log: opts.log,
-        ...(opts.renderer ? { renderer: opts.renderer } : {}),
-        meta: {
-          ...opts.meta,
-          command: 'create',
-          stage: { name: stage.name, index: i + 1, total: STAGES.length },
-          brief: briefMeta,
-        },
-      });
-
-      // Fold this attempt's cost in. Defensive reads: a run that dies very early
-      // (or a scripted test double) may omit stats — never let telemetry throw.
-      cost.turns += res.stats?.turnsUsed ?? 0;
-      cost.tokensIn += res.stats?.tokensIn ?? 0;
-      cost.tokensOut += res.stats?.tokensOut ?? 0;
-      cost.cacheHits += res.cacheHits ?? 0;
-      stageTranscriptDir = res.transcriptDir; // last attempt's run dir (for SVG artifacts / report)
-
-      // A successful run is not the same as a completed stage: an agent can
-      // finish "done" with all gates green having only planned the work (seen
-      // with the schematic stage: one header edit, ERC "clean" on an empty
-      // sheet). Advancing anyway lets every later stage run against a design
-      // that isn't there, so the completion contract is the real gate.
-      // The run's own reason rides along: the diagnosis transcript excerpt holds
-      // only assistant text and tool results, so without it a hung call or a turn
-      // stopped at the hard cap reaches the diagnosis as a bare "provider-error".
-      const failure =
-        res.outcome !== 'success'
-          ? `the run ended as "${res.outcome}" (${res.exitPath})${res.summary ? `: ${res.summary}` : ''}`
-          : !(await stage.isComplete(opts.repoRoot, config.docs))
-            ? await contractGapDetail(stage.name, opts.repoRoot, config)
-            : null;
-      if (!failure) {
-        stageDone = true;
-        break;
-      }
-
-      if (attempt > config.maxStageRetries) {
+        if (stage.name === 'layout-draft') {
+          // a retry re-populates from the pre-stage board: the attempt it
+          // follows may have left footprints populate would refuse to touch
+          if (attempt > 1) await restoreBoard();
+          const populate = await populateStop(opts);
+          if (populate) {
+            opts.log(stageLine(stage.name, `create stopped: ${populate}`, 'err'));
+            break;
+          }
+        }
         opts.log(
           stageLine(
             stage.name,
-            `${failure}; exhausted ${config.maxStageRetries} auto-retry(ies). Stopping for a human.`,
-            'err',
+            `running${attempt > 1 ? ` (attempt ${attempt}/${config.maxStageRetries + 1})` : ''}`,
           ),
         );
-        break;
-      }
+        // The BOM freezes before this stage, so every part's real pins are
+        // computable before the first turn — recomputed per attempt, since a
+        // rolled-back retry can run against a different BOM than its
+        // predecessor. Advisory only: any failure degrades to no block.
+        let dossierBlock = '';
+        if (stage.name === 'schematic') {
+          try {
+            const bomPath = path.join(opts.repoRoot, config.docs, 'BOM.md');
+            if (existsSync(bomPath)) {
+              // Bounded: a slow or wedged library scan must delay the stage by a
+              // fixed cost at most — on timeout the stage simply runs dossier-less.
+              const dossier = await withTimeout(
+                async () => bomSymbolDossier(await readFile(bomPath, 'utf8'), await symbolSearchDirs()),
+                60_000,
+              );
+              if (dossier) {
+                dossierBlock =
+                  '\n\n## Installed-symbol pin dossier (machine-verified)\nEach BOM part resolved against the KiCad libraries installed on THIS machine: the top name-match lib_id and its REAL pins (number=name/electrical-type). Confirm the match fits the BOM part; alternatives are listed. Passives (R/C/L) draw from their canonical Device symbols and are omitted. Use these pins for REF.PIN endpoints instead of reading .kicad_sym files; for any part not listed, call symbol_pins.\n' +
+                  dossier;
+              }
+            }
+          } catch {
+            // the dossier is context, never a gate — the stage runs without it
+          }
+        }
+        const res = await runAgentLoop({
+          repoRoot: opts.repoRoot,
+          model: opts.model,
+          request: `create pipeline stage: ${stage.name}`,
+          stagePrompt: guidance
+            ? `${basePrompt}${dossierBlock}\n\n## Recovery guidance (a previous attempt did not complete this stage — do this differently)\n${guidance}`
+            : `${basePrompt}${dossierBlock}`,
+          interactive: opts.interactive ?? false,
+          allowDirty: true, // stages build on each other's uncommitted state within the pipeline
+          // the populated board is this stage's mutation too: finish needs a
+          // passing DRC on it even when the agent never edits the board
+          ...(layoutBoard ? { preTouched: [layoutBoard] } : {}),
+          ...(stageTurns !== undefined ? { maxTurns: stageTurns } : {}),
+          ...(opts.onBudgetExhausted ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
+          log: opts.log,
+          ...(opts.renderer ? { renderer: opts.renderer } : {}),
+          meta: {
+            ...opts.meta,
+            command: 'create',
+            stage: { name: stage.name, index: i + 1, total: STAGES.length },
+            brief: briefMeta,
+          },
+        });
 
-      opts.log(stageLine(stage.name, `${failure}; asking the model whether to retry…`, 'warn'));
-      const diagnosis = await diagnose({
-        model: opts.model,
-        timeoutMs: config.turnTimeoutMs,
-        compat: resolveCompatSettings(config),
-        stageName: stage.name,
-        stageGoal: basePrompt,
-        failure,
-        transcriptDir: res.transcriptDir,
-        attempt,
-        maxAttempts: config.maxStageRetries + 1,
-      });
-      // Fold the diagnosis call's own tokens into the stage cost (F6): it is a
-      // real model call made on behalf of this stage, so the cost table should
-      // not under-report by omitting it.
-      cost.tokensIn += diagnosis.usage?.inputTokens ?? 0;
-      cost.tokensOut += diagnosis.usage?.outputTokens ?? 0;
-      opts.log(
-        stageLine(
-          stage.name,
-          `diagnosis → ${diagnosis.verdict} — ${diagnosis.reason}`,
-          diagnosis.verdict === 'abort' ? 'err' : 'warn',
-        ),
-      );
-      if (diagnosis.verdict === 'abort') {
-        opts.log(stageLine(stage.name, 'recovery supervisor recommends stopping for a human.', 'err'));
-        break;
+        // Fold this attempt's cost in. Defensive reads: a run that dies very early
+        // (or a scripted test double) may omit stats — never let telemetry throw.
+        cost.turns += res.stats?.turnsUsed ?? 0;
+        cost.tokensIn += res.stats?.tokensIn ?? 0;
+        cost.tokensOut += res.stats?.tokensOut ?? 0;
+        cost.cacheHits += res.cacheHits ?? 0;
+        stageTranscriptDir = res.transcriptDir; // last attempt's run dir (for SVG artifacts / report)
+
+        // A successful run is not the same as a completed stage: an agent can
+        // finish "done" with all gates green having only planned the work (seen
+        // with the schematic stage: one header edit, ERC "clean" on an empty
+        // sheet). Advancing anyway lets every later stage run against a design
+        // that isn't there, so the completion contract is the real gate.
+        // The run's own reason rides along: the diagnosis transcript excerpt holds
+        // only assistant text and tool results, so without it a hung call or a turn
+        // stopped at the hard cap reaches the diagnosis as a bare "provider-error".
+        const failure =
+          res.outcome !== 'success'
+            ? `the run ended as "${res.outcome}" (${res.exitPath})${res.summary ? `: ${res.summary}` : ''}`
+            : !(await stage.isComplete(opts.repoRoot, config.docs))
+              ? await contractGapDetail(stage.name, opts.repoRoot, config)
+              : null;
+        if (!failure) {
+          stageDone = true;
+          break;
+        }
+
+        if (attempt > config.maxStageRetries) {
+          opts.log(
+            stageLine(
+              stage.name,
+              `${failure}; exhausted ${config.maxStageRetries} auto-retry(ies). Stopping for a human.`,
+              'err',
+            ),
+          );
+          break;
+        }
+
+        opts.log(stageLine(stage.name, `${failure}; asking the model whether to retry…`, 'warn'));
+        const diagnosis = await diagnose({
+          model: opts.model,
+          timeoutMs: config.turnTimeoutMs,
+          compat: resolveCompatSettings(config),
+          stageName: stage.name,
+          stageGoal: basePrompt,
+          failure,
+          transcriptDir: res.transcriptDir,
+          attempt,
+          maxAttempts: config.maxStageRetries + 1,
+        });
+        // Fold the diagnosis call's own tokens into the stage cost (F6): it is a
+        // real model call made on behalf of this stage, so the cost table should
+        // not under-report by omitting it.
+        cost.tokensIn += diagnosis.usage?.inputTokens ?? 0;
+        cost.tokensOut += diagnosis.usage?.outputTokens ?? 0;
+        opts.log(
+          stageLine(
+            stage.name,
+            `diagnosis → ${diagnosis.verdict} — ${diagnosis.reason}`,
+            diagnosis.verdict === 'abort' ? 'err' : 'warn',
+          ),
+        );
+        if (diagnosis.verdict === 'abort') {
+          opts.log(stageLine(stage.name, 'recovery supervisor recommends stopping for a human.', 'err'));
+          break;
+        }
+        guidance = diagnosis.guidance ?? `The previous attempt failed: ${failure}. ${diagnosis.reason}`;
       }
-      guidance = diagnosis.guidance ?? `The previous attempt failed: ${failure}. ${diagnosis.reason}`;
+    } finally {
+      if (!stageDone) await restoreBoard();
     }
 
     cost.wallMs = Date.now() - stageStart;

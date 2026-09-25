@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
-import { cp, mkdir, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import type { RunOptions, RunResult } from '../src/agent/loop.js';
 import { tempFixtureRepo } from './helpers.js';
 import { footprintSearchDirs } from '../src/kicad/footprints.js';
@@ -64,7 +65,8 @@ async function writeStageDoc(repoRoot: string, request: string): Promise<void> {
 }
 
 let prevKey: string | undefined;
-beforeEach(() => {
+let emptyConfig: string;
+beforeEach(async () => {
   mockRunAgentLoop.mockReset();
   mockRunAgentLoop.mockImplementation(async (opts) => {
     await writeStageDoc(opts.repoRoot, opts.request);
@@ -74,10 +76,16 @@ beforeEach(() => {
   mockDiagnose.mockResolvedValue({ verdict: 'abort', reason: 'stop' });
   prevKey = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = 'sk-test-dummy';
+  // hermetic: the machine's global fp-lib-table (which may well carry an
+  // Espressif library) stays out; only the stock install and the project table
+  emptyConfig = await mkdtemp(path.join(tmpdir(), 'copperhead-kicadcfg-'));
+  vi.stubEnv('KICAD_CONFIG_HOME', emptyConfig);
 });
-afterEach(() => {
+afterEach(async () => {
   if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
   else process.env.OPENAI_API_KEY = prevKey;
+  vi.unstubAllEnvs();
+  await rm(emptyConfig, { recursive: true, force: true });
 });
 
 const stagesRun = (): string[] => mockRunAgentLoop.mock.calls.map(([o]) => o.request.replace('create pipeline stage: ', ''));

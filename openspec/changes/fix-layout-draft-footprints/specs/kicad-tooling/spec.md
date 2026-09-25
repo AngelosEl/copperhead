@@ -23,7 +23,7 @@ Schematic IR validation SHALL refuse a part whose `footprint` differs from its B
 
 ### Requirement: Project symbol libraries
 
-Symbol resolution SHALL consult the project `sym-lib-table` (with `${KIPRJMOD}` expanded) before the stock symbol directories, skipping rows that point into copperhead's vendored cache. Drafting SHALL keep every row a user added to `sym-lib-table` when it rewrites the vendored rows.
+Symbol resolution SHALL consult the project `sym-lib-table` beside the schematic (with `${KIPRJMOD}` expanded to that directory) before the stock symbol directories, skipping rows that point into copperhead's vendored cache. Drafting SHALL keep every row a user added to `sym-lib-table` verbatim, whatever its layout, when it rewrites the vendored rows, and SHALL refuse to rewrite a table it cannot parse, leaving it unchanged.
 
 #### Scenario: Project-only symbol library resolves
 
@@ -34,3 +34,18 @@ Symbol resolution SHALL consult the project `sym-lib-table` (with `${KIPRJMOD}` 
 
 - **WHEN** the user added a row to `sym-lib-table` and the schematic is drafted again
 - **THEN** the row is still present, alongside the vendored rows
+
+#### Scenario: Multi-line rows survive a draft
+
+- **WHEN** a user row spans several lines, or names its library unquoted
+- **THEN** the row is still present byte for byte after the draft, and the table still parses
+
+#### Scenario: An unreadable table is not rewritten
+
+- **WHEN** the `sym-lib-table` is unbalanced
+- **THEN** drafting fails naming the table, and the file is unchanged
+
+#### Scenario: Project in a subfolder
+
+- **WHEN** the schematic lives in `hardware/` and its library is named only in `hardware/sym-lib-table`
+- **THEN** the symbol resolves from that library

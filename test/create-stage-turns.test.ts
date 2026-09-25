@@ -27,7 +27,7 @@ const mockRunAgentLoop = vi.hoisted(() =>
     if (opts.request.includes('part-selection'))
       await writeFileFs(
         pathMod.join(docs, 'BOM.md'),
-        '# bom\n\n| Refdes | Value | Footprint | MPN | Rationale |\n|---|---|---|---|---|\n| R1 | 10k | R_0603 | RC0603FR-0710KL | bias resistor |\n',
+        '# bom\n\n| Refdes | Value | Footprint | MPN | Rationale |\n|---|---|---|---|---|\n| R1 | 10k | Resistor_SMD:R_0603_1608Metric | RC0603FR-0710KL | bias resistor |\n',
         'utf8',
       );
     return {

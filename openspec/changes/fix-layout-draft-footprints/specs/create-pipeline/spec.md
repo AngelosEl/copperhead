@@ -4,12 +4,17 @@
 
 ### Requirement: Exact footprint resolution
 
-A footprint id `Lib:Name` SHALL resolve only to `Name.kicad_mod` inside the library KiCad itself would call `Lib`, searching the project `fp-lib-table` (with `${KIPRJMOD}` expanded to the project directory), then the user's global `fp-lib-table` for the newest installed KiCad version (following nested `Table` rows), then the stock footprint directories. A `${KICADn_FOOTPRINT_DIR}` variable left unset SHALL default to the stock directory. Resolution SHALL NOT fall back to a symbol's default footprint, a similar package, or another library.
+A footprint id `Lib:Name` SHALL resolve only to `Name.kicad_mod` inside the library KiCad itself would call `Lib`, searching the project `fp-lib-table` (with `${KIPRJMOD}` expanded to the project directory), then the user's global `fp-lib-table` for the newest installed KiCad version (following nested `Table` rows), then the stock footprint directories. A `${KICADn_FOOTPRINT_DIR}` variable left unset SHALL default to the stock directory. Table URIs SHALL also expand `${KICADn_3RD_PARTY}` (default: KiCad's per-user `3rdparty` directory) and the user's path variables from `kicad_common.json`, with the process environment taking precedence. Resolution SHALL NOT fall back to a symbol's default footprint, a similar package, or another library.
 
 #### Scenario: Project-only library resolves
 
 - **WHEN** a footprint's library is named only in the project `fp-lib-table` and no `KICAD_*` variable is set
 - **THEN** the footprint resolves to the file that row points at
+
+#### Scenario: Plugin and Content Manager library resolves
+
+- **WHEN** a global `fp-lib-table` row points at `${KICAD10_3RD_PARTY}/footprints/PCM_Espressif.pretty` and no such environment variable is set
+- **THEN** the row resolves under KiCad's default `3rdparty` directory, not as a missing library
 
 #### Scenario: A miss is never substituted
 
@@ -46,26 +51,53 @@ The `check_footprints` tool SHALL resolve footprint ids exactly as the board pop
 
 ### Requirement: Board populate before layout-draft
 
-Before each layout-draft attempt, the pipeline SHALL place every schematic part on the board: one footprint per netlist component (power symbols and parts excluded from the board omitted), with the schematic's refdes, value, and footprint id, pad geometry byte-identical to the library file, every pad's net equal to the schematic netlist's, and a schematic path link. It SHALL write the board only after KiCad loads the result. An unresolved footprint, or a netlist pin with no matching pad in its footprint, SHALL stop the run and leave the board byte-identical. When the parts do not fit the outline, the scaffold outline SHALL grow roughly square. The scaffold project SHALL allow 0.2 mm holes, which stock QFN thermal vias use. A board already holding exactly the schematic's footprints SHALL be left unchanged; a board holding different footprints SHALL be refused, not rewritten. Populating the same schematic twice SHALL produce byte-identical boards.
+Before each layout-draft attempt, the pipeline SHALL place every schematic part on the board: one footprint per netlist component (power symbols and parts excluded from the board omitted), with the schematic's refdes, value, and footprint id, pad geometry byte-identical to the library file, every pad's net equal to the schematic netlist's, and a schematic path link. It SHALL write the board only after KiCad loads the result, and a board it wrote SHALL pass DRC before the agent's first turn, or the run SHALL stop, naming the findings (and a missing global `fp-lib-table` when KiCad cannot find the libraries). An unresolved footprint, or a netlist pin with no matching pad in its footprint, SHALL stop the run and leave the board byte-identical. A KiCad 5 `(module …)` library file SHALL populate like a current one. When the parts do not fit a single-rectangle outline, that outline SHALL grow roughly square; any other outline SHALL bound the pack, and a pack that does not fit it SHALL stop the run. The scaffold project SHALL allow 0.2 mm holes, which stock QFN thermal vias use, and its custom rules SHALL hold board vias to a 0.3 mm drill. A board already holding exactly the schematic's footprints on the schematic's nets SHALL be left unchanged; a board holding different footprints, or pads on other nets, SHALL be refused, not rewritten. Populating the same schematic twice SHALL produce byte-identical boards, independent of the process locale.
+
+The populated board SHALL be the stage's own mutation: the stage's agent run SHALL count the board as touched, so finishing requires a passing `run_drc`; each retry SHALL start from the pre-stage board, re-populated; and a stage that does not complete (a stop, an abort, exhausted retries, or an error) SHALL leave the board byte-identical to the pre-stage board.
 
 #### Scenario: Populated board matches the schematic
 
 - **WHEN** the schematic stage has completed with every footprint installed
 - **THEN** the board holds every part, and DRC with `--schematic-parity` reports no parity issue and no violation
 
-#### Scenario: Retry does not rewrite
+#### Scenario: Resume on a populated board does not rewrite
 
-- **WHEN** a layout-draft attempt is retried or resumed on a board whose footprints the agent has moved
+- **WHEN** `create` resumes at layout-draft on a board that already holds the schematic's footprints on the schematic's nets
 - **THEN** the populate step writes nothing
+
+#### Scenario: A failed stage restores the pre-stage board
+
+- **WHEN** the layout-draft attempt fails and the diagnosis stops the stage
+- **THEN** the board is byte-identical to the board before the stage
+
+#### Scenario: A retry starts from a fresh populate
+
+- **WHEN** an attempt changed a footprint id and the diagnosis says retry
+- **THEN** the next attempt runs on a freshly populated board instead of stopping on the changed footprint
+
+#### Scenario: A populated board that fails DRC stops
+
+- **WHEN** KiCad cannot find the footprint libraries because the machine has no global `fp-lib-table`
+- **THEN** the run stops before any agent turn, names `lib_footprint_issues` and the missing table, and restores the board
+
+#### Scenario: Finishing needs a DRC on the populated board
+
+- **WHEN** the layout-draft agent run starts
+- **THEN** the board counts as touched by the run, so it cannot finish without a passing `run_drc`
 
 ### Requirement: Unrouted connections are counted, not failed
 
-DRC SHALL report unrouted connections as a count beside the result and SHALL NOT count them as violations, so a draft board whose placed and routed copper is clean passes the DRC gate and `check` while nets remain unrouted. Clearance, short, courtyard, and schematic-parity findings SHALL still fail.
+DRC SHALL report unrouted connections as a count beside the result and SHALL NOT count them as violations, so a draft board whose placed and routed copper is clean passes `check` while nets remain unrouted; `check --json` SHALL carry `unrouted` and `intrinsic` counts in its `drc` object. An agent run's `run_drc` SHALL fail when the board has more unrouted connections than it had when the run started. Clearance, short, and courtyard findings SHALL still fail.
 
 #### Scenario: Ratsnest board passes
 
 - **WHEN** the populated board is placed but unrouted, with no other finding
 - **THEN** DRC is clean and reports the unrouted count
+
+#### Scenario: A broken connection fails the run
+
+- **WHEN** an agent run deletes a track, leaving one more unrouted connection than the board started with
+- **THEN** `run_drc` fails with an `unrouted_increase` violation
 
 #### Scenario: A real violation still fails
 
@@ -74,12 +106,17 @@ DRC SHALL report unrouted connections as a count beside the result and SHALL NOT
 
 ### Requirement: Library-intrinsic findings are reported, not failed
 
-A DRC finding whose every item belongs to one footprint SHALL be reported beside the result as library-intrinsic and SHALL NOT fail the DRC gate or `check`; a finding spanning two parts or involving copper outside a footprint SHALL still fail. The layout-draft prompt SHALL tell the agent to name such findings in Draft quality rather than try to fix them.
+A DRC finding whose every item belongs to one footprint SHALL be reported beside the result as library-intrinsic and SHALL NOT fail the DRC gate or `check`; a finding spanning two parts, involving copper outside a footprint, putting two different nets against each other, or inside a footprint KiCad reports as modified or cannot find in its libraries SHALL still fail. The layout-draft prompt SHALL tell the agent to name such findings in Draft quality rather than try to fix them.
 
 #### Scenario: A footprint's own hole clearance
 
 - **WHEN** DRC reports a hole clearance between pad A1 of J1 and the NPTH peg of J1
 - **THEN** DRC is clean, and the finding is listed as inside J1
+
+#### Scenario: A short inside one footprint
+
+- **WHEN** DRC reports a short between pad A4 [VCC] and pad B9 [GND] of J1
+- **THEN** DRC fails
 
 #### Scenario: Clearance between two parts
 
@@ -102,7 +139,7 @@ Layout SHALL place parts with a `move_footprint` tool (refdes, x, y, optional ab
 
 ### Requirement: Strict layout-draft completion
 
-The layout-draft stage SHALL complete only when the board's (refdes, footprint id) pairs equal the schematic netlist's exactly and LAYOUT.md has its `## Draft quality` section. The stage prompt SHALL tell the agent the parts are already placed and that it moves footprints and routes, never adding, deleting, or rewriting a footprint, pad, or net.
+The layout-draft stage SHALL complete only when the board's (refdes, footprint id) pairs equal the schematic netlist's exactly, every pad of those parts is on its schematic netlist net, and LAYOUT.md has its `## Draft quality` section. The stage prompt SHALL tell the agent the parts are already placed and that it moves footprints and routes, never adding, deleting, or rewriting a footprint, pad, or net.
 
 #### Scenario: Outline-only board does not complete
 
@@ -113,3 +150,8 @@ The layout-draft stage SHALL complete only when the board's (refdes, footprint i
 
 - **WHEN** a footprint's id or refdes on the board differs from the schematic
 - **THEN** the stage is not complete, and the contract-gap detail names the difference
+
+#### Scenario: A re-netted pad does not complete
+
+- **WHEN** a pad's net on the board differs from the schematic netlist
+- **THEN** the stage is not complete, and the contract-gap detail names the pad and both nets

@@ -98,13 +98,24 @@ function emptyBoard(outlineUuid: string): string {
 `;
 }
 
+/**
+ * Custom rules beside the scaffold's project. The project allows 0.2 mm holes
+ * so stock footprints' thermal vias pass DRC; this holds the vias layout adds
+ * to the 0.3 mm drill a standard 2-layer fab process needs (#314).
+ */
+const DESIGN_RULES = `(version 1)
+(rule "via drill"
+  (condition "A.Type == 'Via'")
+  (constraint hole_size (min 0.3mm)))
+`;
+
 function projectFile(slug: string, rootUuid: string): string {
   return (
     JSON.stringify(
       {
         // Stock KiCad footprints put 0.2 mm vias in QFN thermal pads; KiCad's
         // 0.3 mm default would fail DRC on footprints the layout stage may not
-        // edit (#314). 0.2 mm is within JLCPCB's standard process.
+        // edit (#314). Board vias stay at 0.3 mm through DESIGN_RULES.
         board: { design_settings: { defaults: {}, rules: { min_through_hole_diameter: 0.2 } } },
         erc: {
           erc_exclusions: [],
@@ -196,6 +207,7 @@ export async function bootstrapKicadProject(repoRoot: string, brief: string): Pr
     await writeFile(schAbs, emptySchematic(rootUuid), 'utf8');
     await writeFile(path.join(repoRoot, pcbRel), emptyBoard(uuidFrom(`${slug}:edge`)), 'utf8');
     await writeFile(path.join(repoRoot, proRel), projectFile(slug, rootUuid), 'utf8');
+    await writeFile(path.join(repoRoot, `${slug}.kicad_dru`), DESIGN_RULES, 'utf8');
   }
 
   config.schematic = schRel;

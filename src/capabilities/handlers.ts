@@ -2,8 +2,8 @@ import path from 'node:path';
 import { writeFile, mkdir, appendFile, readFile } from 'node:fs/promises';
 import { toolReadFile, toolWriteFile, toolEditFile, toolSearch } from '../agent/filetools.js';
 import { resolveInRepo, isKicadFile } from '../util/paths.js';
-import { runErc, runDrc, exportSvg, exportFab, kicadLoadError, isProbeableKicadFile } from '../kicad/cli.js';
-import { formatViolations } from '../kicad/report.js';
+import { runErc, runDrc, unroutedCount, exportSvg, exportFab, kicadLoadError, isProbeableKicadFile } from '../kicad/cli.js';
+import { formatViolations, type CheckReport } from '../kicad/report.js';
 import { listSymbols, listNets } from '../kicad/sexp.js';
 import { checkLegibility, formatLegibility } from '../kicad/legibility.js';
 import { scoreSchematic, formatScore } from '../kicad/score.js';
@@ -19,6 +19,38 @@ import { isEngineAuthoredSchematic } from '../kicad/fab.js';
 import type { ToolSchema } from '../agent/types.js';
 import type { RunContext } from '../agent/context.js';
 import { corruptionError, markTouched, str } from './helpers.js';
+
+/**
+ * A run may leave nets as ratsnest, but never more than its board started
+ * with (AC-15.39): unrouted connections are a count beside a clean DRC for
+ * `check`, and a violation for an agent run that raised it, since that means
+ * the run broke a track or connection. The baseline is counted once, on the
+ * board as the run found it.
+ */
+export async function unroutedGuard(ctx: RunContext, boardPath: string, report: CheckReport): Promise<CheckReport> {
+  if (typeof ctx.boardAtStart !== 'string' || report.unrouted === undefined) return report;
+  if (ctx.unroutedBaseline === undefined) {
+    const now = await readFile(boardPath, 'utf8').catch(() => null);
+    ctx.unroutedBaseline = now === ctx.boardAtStart ? report.unrouted : await unroutedCount(ctx.boardAtStart);
+  }
+  const baseline = ctx.unroutedBaseline;
+  if (report.unrouted <= baseline) return report;
+  return {
+    ...report,
+    ok: false,
+    violations: [
+      ...report.violations,
+      {
+        severity: 'error',
+        type: 'unrouted_increase',
+        description:
+          `this run left ${report.unrouted} unrouted connection(s) where the board started with ${baseline}: ` +
+          'an edit broke a track or connection; restore it (or route the new ratsnest) before finishing',
+        items: [],
+      },
+    ],
+  };
+}
 
 export interface HandlerOutcome {
   ok: boolean;
@@ -579,7 +611,8 @@ export const HANDLERS: HandlerDef[] = [
     handler: async (ctx) => {
       if (!ctx.config.board)
         return 'no board configured; DRC does not apply yet — skip it until a board exists and is set in .copperhead/config.json';
-      const report = await runDrc(path.join(ctx.repoRoot, ctx.config.board));
+      const boardPath = path.join(ctx.repoRoot, ctx.config.board);
+      const report = await unroutedGuard(ctx, boardPath, await runDrc(boardPath));
       ctx.lastDrc = report;
       if (report.ok) ctx.ledger.clear('drc');
       else ctx.repairCycles++;

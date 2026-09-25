@@ -293,7 +293,7 @@ export class SymbolSource {
    */
   private async projectLibrary(lib: string): Promise<string | null> {
     this.projectLibs ??= (async () => {
-      const { rows } = await libTableRows('sym', { projectDir: this.repoRoot, global: false });
+      const { rows } = await libTableRows('sym', { projectDir: this.projectDir ?? this.repoRoot, global: false });
       const cache = path.resolve(this.cacheDir());
       const out = new Map<string, string>();
       for (const [name, row] of rows) {
@@ -311,11 +311,15 @@ export class SymbolSource {
    *   vendored cache or the installed libraries verbatim, but nothing is copied
    *   into `sym-lib-cache/`. For read-shaped callers (`draftSchematicToText`, staleness
    *   probes) that must not mutate the working tree.
+   * @param projectDir the directory holding the `.kicad_pro` (beside the
+   *   schematic): its `sym-lib-table` and `${KIPRJMOD}`. Defaults to `repoRoot`,
+   *   which is right only for a project at the repo root.
    */
   constructor(
     private readonly repoRoot: string,
     private readonly searchDirs?: string[],
     private readonly vendor: boolean = true,
+    private readonly projectDir?: string,
   ) {}
 
   cacheDir(): string {

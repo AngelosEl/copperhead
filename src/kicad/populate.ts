@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseSexp, children, child, isList, type SexpNode } from './sexp.js';
+import { childSpans, listEnd, type Span } from './spans.js';
 import { exportNetlist, kicadLoadError } from './cli.js';
 import { uuidv5 } from './emit.js';
 import {
@@ -48,6 +49,14 @@ const atom = (node: SexpNode[] | undefined, idx: number): string | undefined => 
   return typeof v === 'string' ? v : undefined;
 };
 
+// Orderings that decide net codes and placement must not follow the process
+// locale, or two machines would write different boards from one schematic
+// (AC-15.37): a fixed collation for refdes and pad numbers, code units for
+// net names.
+const collator = new Intl.Collator('en', { numeric: true });
+const byRef = (a: string, b: string): number => collator.compare(a, b);
+const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
 /** Board-bound parts and nets from a kicadsexpr netlist. */
 export function parseNetlist(text: string): Netlist {
   const root = parseSexp(text)[0];
@@ -87,47 +96,8 @@ export function parseNetlist(text: string): Netlist {
     }
     if (nodes.length) nets.set(name, nodes);
   }
-  parts.sort((a, b) => a.ref.localeCompare(b.ref, undefined, { numeric: true }));
+  parts.sort((a, b) => byRef(a.ref, b.ref));
   return { parts, nets };
-}
-
-// ---- source-text spans ------------------------------------------------------
-
-interface Span {
-  start: number;
-  /** exclusive */
-  end: number;
-  tag: string;
-}
-
-/** End (exclusive) of the list opening at `open`, honoring quoted strings. */
-function listEnd(text: string, open: number): number {
-  let depth = 0;
-  for (let i = open; i < text.length; i++) {
-    const c = text[i];
-    if (c === '"') {
-      for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === '\\') i++;
-    } else if (c === '(') depth++;
-    else if (c === ')' && --depth === 0) return i + 1;
-  }
-  throw new Error('unbalanced s-expression');
-}
-
-/** Direct child lists of the list opening at `open`. */
-function childSpans(text: string, open: number): Span[] {
-  const end = listEnd(text, open);
-  const out: Span[] = [];
-  for (let i = open + 1; i < end - 1; i++) {
-    const c = text[i];
-    if (c === '"') {
-      for (i++; i < end && text[i] !== '"'; i++) if (text[i] === '\\') i++;
-    } else if (c === '(') {
-      const e = listEnd(text, i);
-      out.push({ start: i, end: e, tag: /^\(\s*([^\s()"]+)/.exec(text.slice(i, i + 64))?.[1] ?? '' });
-      i = e - 1;
-    }
-  }
-  return out;
 }
 
 const q = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
@@ -227,7 +197,9 @@ export interface Instance {
  * graphic geometry is carried over byte-for-byte.
  */
 export function instantiateFootprint(modText: string, inst: Instance): string {
-  const open = modText.indexOf('(footprint');
+  // KiCad 5 libraries (still common in vendor downloads) open with `(module`;
+  // the head is rewritten either way, and KiCad's load probe vets the rest
+  const open = /\((?:footprint|module)[\s"]/.exec(modText)?.index ?? -1;
   if (open < 0) throw new Error(`${inst.fpId}: not a footprint file`);
   const parts: string[] = [`(footprint ${q(inst.fpId)}`];
   let placed = false;
@@ -237,13 +209,17 @@ export function instantiateFootprint(modText: string, inst: Instance): string {
   ];
   for (const s of childSpans(modText, open)) {
     let t = modText.slice(s.start, s.end);
-    if (s.tag === 'version' || s.tag === 'generator' || s.tag === 'generator_version' || s.tag === 'uuid' || s.tag === 'at') continue;
+    // library-only header lines, and the KiCad 5 edit timestamps (`tedit`,
+    // `tstamp`) a board no longer carries
+    if (['version', 'generator', 'generator_version', 'uuid', 'at', 'tedit', 'tstamp'].includes(s.tag)) continue;
     if (s.tag === 'property' || s.tag === 'fp_text') {
+      // a KiCad 5 library writes the refdes and value unquoted (`REF**`)
+      const token = '(?:"(?:[^"\\\\]|\\\\.)*"|[^\\s()"]+)';
       t = t
-        .replace(/^\(property\s+"Reference"\s+"(?:[^"\\]|\\.)*"/, `(property "Reference" ${q(inst.ref)}`)
-        .replace(/^\(property\s+"Value"\s+"(?:[^"\\]|\\.)*"/, `(property "Value" ${q(inst.value)}`)
-        .replace(/^\(fp_text\s+reference\s+"(?:[^"\\]|\\.)*"/, `(fp_text reference ${q(inst.ref)}`)
-        .replace(/^\(fp_text\s+value\s+"(?:[^"\\]|\\.)*"/, `(fp_text value ${q(inst.value)}`);
+        .replace(new RegExp(`^\\(property\\s+"Reference"\\s+${token}`), `(property "Reference" ${q(inst.ref)}`)
+        .replace(new RegExp(`^\\(property\\s+"Value"\\s+${token}`), `(property "Value" ${q(inst.value)}`)
+        .replace(new RegExp(`^\\(fp_text\\s+reference\\s+${token}`), `(fp_text reference ${q(inst.ref)}`)
+        .replace(new RegExp(`^\\(fp_text\\s+value\\s+${token}`), `(fp_text value ${q(inst.value)}`);
     } else if (s.tag === 'pad') {
       const pad = /^\(pad\s+"((?:[^"\\]|\\.)*)"/.exec(t)?.[1] ?? /^\(pad\s+([^\s()"]+)/.exec(t)?.[1] ?? '';
       const net = pad ? inst.padNet(pad) : undefined;
@@ -330,6 +306,44 @@ export function boardFootprints(boardText: string): { ref: string; footprint: st
   return out;
 }
 
+/** Every numbered pad on a board with its net name ('' for a pad on no net). */
+export function boardPads(boardText: string): { ref: string; pad: string; net: string }[] {
+  const root = parseSexp(boardText)[0];
+  if (!root || !isList(root)) return [];
+  const out: { ref: string; pad: string; net: string }[] = [];
+  for (const fp of children(root, 'footprint')) {
+    let ref = '';
+    for (const p of children(fp, 'property')) if (atom(p, 1) === 'Reference') ref = atom(p, 2) ?? '';
+    if (!ref) for (const t of children(fp, 'fp_text')) if (atom(t, 1) === 'reference') ref = atom(t, 2) ?? '';
+    for (const pad of children(fp, 'pad')) {
+      const n = atom(pad, 1);
+      if (!n) continue;
+      // `(net 3 "GND")`, or `(net "GND")` where a board omits net codes
+      const net = child(pad, 'net');
+      out.push({ ref, pad: n, net: (net && net.length >= 3 ? atom(net, 2) : atom(net, 1)) ?? '' });
+    }
+  }
+  return out;
+}
+
+/**
+ * Pads of the schematic's parts whose board net differs from the schematic
+ * netlist (AC-15.38): a renamed or reassigned pad net, or a board populated
+ * before the schematic was rewired. Each reads "R1.2 (VCC, schematic GND)".
+ */
+export function padNetMismatches(boardText: string, netlist: Netlist): string[] {
+  const want = new Map<string, string>();
+  for (const [name, nodes] of netlist.nets) for (const [ref, pin] of nodes) want.set(`${ref}\0${pin}`, name);
+  const refs = new Set(netlist.parts.map((p) => p.ref));
+  const out = new Set<string>();
+  for (const p of boardPads(boardText)) {
+    if (!refs.has(p.ref)) continue;
+    const w = want.get(`${p.ref}\0${p.pad}`) ?? '';
+    if (p.net !== w) out.add(`${p.ref}.${p.pad} (${p.net || 'no net'}, schematic ${w || 'no net'})`);
+  }
+  return [...out];
+}
+
 /** Do the board's (ref, footprint) pairs equal the netlist parts', exactly? */
 export function boardMatchesNetlist(
   onBoard: { ref: string; footprint: string }[],
@@ -374,6 +388,38 @@ function outlineRect(boardText: string, open: number): OutlineRect | null {
   return { start: rects[0]!.start, end: rects[0]!.end, x1: Math.min(a, c), y1: Math.min(b, d), x2: Math.max(a, c), y2: Math.max(b, d) };
 }
 
+/**
+ * The box around every Edge.Cuts item, for an outline populate cannot resize
+ * (rounded corners, mounting-hole cutouts, a polygon). Null without one.
+ */
+function outlineBox(boardText: string, open: number): Bounds | null {
+  const b: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (const s of childSpans(boardText, open)) {
+    if (!/^gr_(line|arc|circle|poly|rect)$/.test(s.tag)) continue;
+    const t = boardText.slice(s.start, s.end);
+    if (!/\(layer\s+"?Edge\.Cuts"?\)/.test(t)) continue;
+    const pts = [...t.matchAll(/\((start|mid|end|center|xy)\s+([-\d.]+)\s+([-\d.]+)\)/g)].map((m) => ({
+      k: m[1],
+      x: Number(m[2]),
+      y: Number(m[3]),
+    }));
+    const center = pts.find((p) => p.k === 'center');
+    const end = pts.find((p) => p.k === 'end');
+    if (s.tag === 'gr_circle' && center && end) {
+      const r = Math.hypot(end.x - center.x, end.y - center.y);
+      pts.push({ k: 'r', x: center.x - r, y: center.y - r }, { k: 'r', x: center.x + r, y: center.y + r });
+    }
+    for (const p of pts) {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+      b.minX = Math.min(b.minX, p.x);
+      b.minY = Math.min(b.minY, p.y);
+      b.maxX = Math.max(b.maxX, p.x);
+      b.maxY = Math.max(b.maxY, p.y);
+    }
+  }
+  return Number.isFinite(b.minX) ? b : null;
+}
+
 const GAP = 1; // mm between courtyards
 const MARGIN = 1; // mm from the outline
 
@@ -399,8 +445,15 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
   const onBoard = boardFootprints(boardText);
   if (onBoard.length) {
     const cmp = boardMatchesNetlist(onBoard, netlist.parts);
-    if (cmp.ok) {
+    const stale = cmp.ok ? padNetMismatches(boardText, netlist) : [];
+    if (cmp.ok && !stale.length) {
       return { placed: [], nets: netlist.nets.size, outline: { width: 0, height: 0, grown: false }, unchanged: true };
+    }
+    if (cmp.ok) {
+      throw new Error(
+        `${opts.board} already has the schematic's footprints, but ${stale.length} pad net(s) differ from the schematic ` +
+          `(${stale.slice(0, 8).join('; ')}${stale.length > 8 ? '; …' : ''}); populate fills an empty board only`,
+      );
     }
     throw new Error(
       `${opts.board} already has footprints that do not match the schematic` +
@@ -415,7 +468,7 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
   if (missing.length) throw new MissingFootprintsError(missing, resolver.searched);
 
   // net codes: sorted by name, so the same schematic always numbers the same way
-  const netNames = [...netlist.nets.keys()].sort((a, b) => a.localeCompare(b));
+  const netNames = [...netlist.nets.keys()].sort(byCodeUnit);
   const code = new Map(netNames.map((n, i) => [n, i + 1]));
   const netOf = new Map<string, [number, string]>();
   for (const [name, nodes] of netlist.nets) for (const [ref, pin] of nodes) netOf.set(`${ref}\0${pin}`, [code.get(name)!, name]);
@@ -440,8 +493,7 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
     const pads = padNumbers(mods.get(p.footprint)!.text);
     const pins = [...(pinsOf.get(p.ref) ?? [])].filter((pin) => !pads.has(pin));
     if (pins.length) {
-      const byNum = (a: string, b: string): number => a.localeCompare(b, undefined, { numeric: true });
-      mismatches.push({ ref: p.ref, footprint: p.footprint, pins: pins.sort(byNum), pads: [...pads].sort(byNum) });
+      mismatches.push({ ref: p.ref, footprint: p.footprint, pins: pins.sort(byRef), pads: [...pads].sort(byRef) });
     }
   }
   if (mismatches.length) throw new PadMismatchError(mismatches);
@@ -454,7 +506,7 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
       const bb = boundsOf.get(p.ref)!;
       return (bb.maxX - bb.minX) * (bb.maxY - bb.minY);
     };
-    return area(b) - area(a) || a.ref.localeCompare(b.ref, undefined, { numeric: true });
+    return area(b) - area(a) || byRef(a.ref, b.ref);
   });
   const boxes = order.map((p) => {
     const bb = boundsOf.get(p.ref)!;
@@ -464,12 +516,21 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
   const open = boardText.indexOf('(kicad_pcb');
   if (open < 0) throw new Error(`${opts.board} is not a KiCad board`);
   const rect = outlineRect(boardText, open);
-  const origin = rect ? { x: rect.x1 + MARGIN, y: rect.y1 + MARGIN } : { x: 100 + MARGIN, y: 100 + MARGIN };
+  // an outline populate cannot resize still bounds the pack: parts go inside
+  // its box, and a pack that does not fit stops instead of landing off-board
+  const fixed = rect ? null : outlineBox(boardText, open);
+  const origin = rect
+    ? { x: rect.x1 + MARGIN, y: rect.y1 + MARGIN }
+    : fixed
+      ? { x: fixed.minX + MARGIN, y: fixed.minY + MARGIN }
+      : { x: 100 + MARGIN, y: 100 + MARGIN };
   const totalArea = boxes.reduce((s, b) => s + (b.w + GAP) * (b.h + GAP), 0);
   const widest = Math.max(...boxes.map((b) => b.w));
   // rows as wide as the outline, or roughly square when the parts need more
   // room than it has, so a large design grows the board both ways
-  const width = Math.max(widest, rect ? rect.x2 - rect.x1 - 2 * MARGIN : 0, Math.sqrt(totalArea));
+  const width = fixed
+    ? Math.max(widest, fixed.maxX - fixed.minX - 2 * MARGIN)
+    : Math.max(widest, rect ? rect.x2 - rect.x1 - 2 * MARGIN : 0, Math.sqrt(totalArea));
   const origins = shelfPack(boxes, width, GAP);
 
   const blocks = order.map((p, i) => {
@@ -489,6 +550,13 @@ export async function populateBoard(opts: PopulateOptions): Promise<PopulateResu
   });
   const usedW = Math.max(...order.map((_, i) => origins[i]!.x + boxes[i]!.w));
   const usedH = Math.max(...order.map((_, i) => origins[i]!.y + boxes[i]!.h));
+  if (fixed && (usedW + 2 * MARGIN > fixed.maxX - fixed.minX || usedH + 2 * MARGIN > fixed.maxY - fixed.minY)) {
+    throw new Error(
+      `the parts need about ${Math.ceil(usedW + 2 * MARGIN)} x ${Math.ceil(usedH + 2 * MARGIN)} mm, more than the ` +
+        `${num(fixed.maxX - fixed.minX)} x ${num(fixed.maxY - fixed.minY)} mm outline of ${opts.board}, and populate ` +
+        'grows only a single-rectangle outline; enlarge the Edge.Cuts outline, then re-run',
+    );
+  }
 
   // splice: net table after `(net 0 "")` (or before the first footprint-able
   // item), outline grown when the pack overflows it, footprints before the

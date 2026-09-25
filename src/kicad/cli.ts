@@ -1,6 +1,6 @@
 import { execa, ExecaError } from 'execa';
 import { existsSync, readdirSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { normalizeReport, type CheckReport } from './report.js';
@@ -328,6 +328,22 @@ export async function kicadLoadError(filePath: string): Promise<string | null> {
 
 export function runDrc(pcbPath: string): Promise<CheckReport> {
   return runCheck('drc', pcbPath);
+}
+
+/**
+ * Unrouted connections on a board given as text (a run's starting board, say).
+ * Connectivity depends only on the board's own copper, so a lone temp copy
+ * gives the same count as the board in place.
+ */
+export async function unroutedCount(boardText: string): Promise<number> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'copperhead-unrouted-'));
+  try {
+    const probe = path.join(dir, 'baseline.kicad_pcb');
+    await writeFile(probe, boardText, 'utf8');
+    return (await runDrc(probe)).unrouted ?? 0;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 /** The schematic's KiCad netlist (kicadsexpr), as text. Throws kicad-cli's own error. */

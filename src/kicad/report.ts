@@ -27,7 +27,8 @@ export interface CheckReport {
    * USB-C footprint's pad 0.18 mm from its own peg hole). Placement cannot
    * move them and layout may not edit footprints, so they are reported
    * beside the result, never a failure (#314). Anything spanning two parts,
-   * or copper outside a footprint, stays a violation.
+   * copper outside a footprint, two different nets, or a footprint KiCad
+   * reports as modified or unresolvable stays a violation.
    */
   intrinsic?: Violation[];
 }
@@ -76,11 +77,13 @@ export function normalizeReport(raw: unknown, source: 'erc' | 'drc'): CheckRepor
   for (const sheet of r.sheets ?? []) {
     for (const v of sheet.violations ?? []) violations.push(normViolation(v, sheet.path));
   }
-  // a footprint that no longer matches its library was edited on the board,
-  // so what lies inside it is not the library's doing and is not excused
-  const modified = new Set(
+  // A footprint KiCad cannot vouch for is never excused: one that no longer
+  // matches its library was edited on the board, and one whose library KiCad
+  // cannot find (`lib_footprint_issues`) was never compared at all, so what
+  // lies inside either is not known to be the library's doing.
+  const unvouched = new Set(
     (r.violations ?? [])
-      .filter((v) => v.type === 'lib_footprint_mismatch')
+      .filter((v) => v.type === 'lib_footprint_mismatch' || v.type === 'lib_footprint_issues')
       .flatMap((v) => (v.items ?? []).map((i) => /^Footprint (\S+)/.exec(i.description ?? '')?.[1]))
       .filter((x): x is string => !!x),
   );
@@ -88,12 +91,29 @@ export function normalizeReport(raw: unknown, source: 'erc' | 'drc'): CheckRepor
   for (const v of r.violations ?? []) {
     const n = normViolation(v);
     const owner = source === 'drc' ? footprintOwner(n) : null;
-    if (owner && !modified.has(owner)) intrinsic.push(n);
+    if (owner && !unvouched.has(owner) && !joinsNets(n)) intrinsic.push(n);
     else violations.push(n);
   }
   for (const v of r.schematic_parity ?? []) violations.push(normViolation(v));
   const unrouted = r.unconnected_items?.length ?? 0;
   return { ok: violations.length === 0, source, violations, ...(source === 'drc' ? { unrouted, intrinsic } : {}) };
+}
+
+/**
+ * Does a finding put two different nets against each other? A short, or a
+ * clearance between pads on different nets, is an electrical fault whichever
+ * footprint it sits in (two schematic nets wired onto coincident pads of one
+ * stock part), so it is never library-intrinsic. KiCad names a pad's net in
+ * brackets: "Pad A4 [VCC] of J1 on F.Cu".
+ */
+export function joinsNets(v: Violation): boolean {
+  if (v.type === 'shorting_items') return true;
+  const nets = new Set<string>();
+  for (const i of v.items) {
+    const net = /\[([^\]]*)\]/.exec(i.description)?.[1];
+    if (net && net !== '<no net>') nets.add(net);
+  }
+  return nets.size > 1;
 }
 
 /**

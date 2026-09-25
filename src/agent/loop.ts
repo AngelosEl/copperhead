@@ -23,6 +23,7 @@ import { collectRunMeta, renderCliHeader, type RunMeta, type RunMetaInput } from
 import { plainRenderer, fmtDuration, fmtTokens, type ProgressRenderer } from './render.js';
 import { styleHeaderLines } from './theme.js';
 import { ObligationsLedger } from './ledger.js';
+import { markTouched } from '../capabilities/helpers.js';
 import { gitPreflight, isDirty, snapshot, restore, commitAll, changedFiles, preserveFailedRun } from '../util/git.js';
 import { withRetry, isRateLimit, sessionLimit } from '../util/retry.js';
 import { openspecArchive } from '../openspec/cli.js';
@@ -67,6 +68,12 @@ export interface RunOptions {
   renderer?: ProgressRenderer;
   /** Caller-known run identity for the metadata block (design D2). */
   meta?: RunMetaInput;
+  /**
+   * Repo-relative files a caller changed just before the run (the create
+   * pipeline's board populate). They count as touched by the run, so its
+   * verification and sync obligations apply to them too.
+   */
+  preTouched?: string[];
 }
 
 export interface RunResult {
@@ -264,9 +271,18 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     lastLegibility: null,
     lastScore: null,
     lastDrc: null,
+    boardAtStart: null,
     repairCycles: 0,
     finishRequest: null,
   };
+  if (config.board) {
+    try {
+      ctx.boardAtStart = await readFile(path.join(repoRoot, config.board), 'utf8');
+    } catch {
+      // no board yet: nothing to compare unrouted connections against
+    }
+  }
+  for (const f of opts.preTouched ?? []) markTouched(ctx, f);
 
   // Session resume for claude-code / cursor is only correct when the response
   // cache is off: the cache replays turns a resumed session never saw. So enable

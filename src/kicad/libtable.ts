@@ -77,6 +77,38 @@ export async function kicadConfigDirs(env = process.env, platform = process.plat
 }
 
 /**
+ * The path variables KiCad itself defines for table URIs, below the process
+ * environment: `KICAD<n>_3RD_PARTY` (where the Plugin and Content Manager
+ * installs libraries, and how it writes their rows) at KiCad's default
+ * location, then the user's own variables from `kicad_common.json`
+ * (Preferences > Configure Paths). Without them such a row expands to nothing
+ * and an installed library reads as missing.
+ */
+export async function kicadPathVars(env = process.env, platform = process.platform): Promise<Record<string, string>> {
+  const vars: Record<string, string> = {};
+  const configDir = (await kicadConfigDirs(env, platform))[0];
+  const version = configDir ? path.basename(configDir) : null;
+  if (version) {
+    const home = env.HOME || env.USERPROFILE || os.homedir();
+    const major = version.split('.')[0];
+    const dataRoot =
+      platform === 'linux' || (platform !== 'win32' && platform !== 'darwin')
+        ? path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'kicad')
+        : path.join(env.KICAD_DOCUMENTS_HOME || path.join(home, 'Documents'), 'KiCad');
+    vars[`KICAD${major}_3RD_PARTY`] = path.join(dataRoot, version, '3rdparty');
+    try {
+      const common = JSON.parse(await readFile(path.join(configDir!, 'kicad_common.json'), 'utf8')) as {
+        environment?: { vars?: Record<string, unknown> | null };
+      };
+      for (const [k, v] of Object.entries(common.environment?.vars ?? {})) if (typeof v === 'string' && v) vars[k] = v;
+    } catch {
+      // no kicad_common.json, or unreadable: KiCad's defaults stand
+    }
+  }
+  return vars;
+}
+
+/**
  * Rows of one table file, nested `Table` rows inlined in place. Disabled rows
  * and non-KiCad plugin types (Legacy, Eagle, …) are skipped: copperhead reads
  * only KiCad-format libraries. First row for a nickname wins, as in KiCad.
@@ -132,7 +164,12 @@ export async function libTableRows(
   opts: LibTableOptions,
 ): Promise<{ rows: Map<string, LibTableRow>; searched: string[] }> {
   const env = opts.env ?? process.env;
-  const vars: Record<string, string | undefined> = { ...opts.defaults, ...env, KIPRJMOD: opts.projectDir };
+  const vars: Record<string, string | undefined> = {
+    ...opts.defaults,
+    ...(await kicadPathVars(env)),
+    ...env,
+    KIPRJMOD: opts.projectDir,
+  };
   const rows: LibTableRow[] = [];
   const searched: string[] = [];
   const projectTable = path.join(opts.projectDir, TABLE_FILE[kind]);

@@ -269,7 +269,7 @@ describe('part-selection isComplete', () => {
       await mkdir(path.join(root, DOCS), { recursive: true });
       await writeFile(
         path.join(root, DOCS, 'BOM.md'),
-        `# Bill of Materials\n\n| Refdes | Value | Footprint | MPN | Rationale |\n|---|---|---|---|---|\n| R1 | 10k | R_0603 | RC0603FR-0710KL | standard 1% bias |\n| U1 | ESP32 | ESP32-S3-MINI-1 | ESP32-S3-MINI-1-N8 | BLE + Wi-Fi module |\n`,
+        `# Bill of Materials\n\n| Refdes | Value | Footprint | MPN | Rationale |\n|---|---|---|---|---|\n| R1 | 10k | Resistor_SMD:R_0603_1608Metric | RC0603FR-0710KL | standard 1% bias |\n| U1 | ESP32 | RF_Module:ESP32-S3-WROOM-1 | ESP32-S3-WROOM-1-N8 | BLE + Wi-Fi module |\n`,
         'utf8',
       );
       expect(await stageNamed('part-selection')(root, DOCS)).toBe(true);
