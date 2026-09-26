@@ -3,7 +3,7 @@ import { writeFile, mkdir, appendFile, readFile } from 'node:fs/promises';
 import { toolReadFile, toolWriteFile, toolEditFile, toolSearch } from '../agent/filetools.js';
 import { resolveInRepo, isKicadFile } from '../util/paths.js';
 import { runErc, runDrc, exportSvg, exportFab, kicadLoadError, isProbeableKicadFile } from '../kicad/cli.js';
-import { formatViolations } from '../kicad/report.js';
+import { formatViolations, type CheckReport } from '../kicad/report.js';
 import { listSymbols, listNets } from '../kicad/sexp.js';
 import { checkLegibility, formatLegibility } from '../kicad/legibility.js';
 import { scoreSchematic, formatScore } from '../kicad/score.js';
@@ -17,6 +17,42 @@ import { isEngineAuthoredSchematic } from '../kicad/fab.js';
 import type { ToolSchema } from '../agent/types.js';
 import type { RunContext } from '../agent/context.js';
 import { corruptionError, markTouched, str } from './helpers.js';
+
+/**
+ * Findings that say nothing about whether a repair worked: silkscreen text (cosmetic,
+ * fixed only by moving text) and, where DRC reports them as violations, unrouted
+ * connections (ratsnest shrinks as routing progresses, and can hide a new short).
+ */
+const isCosmetic = (v: { type: string }) => v.type.startsWith('silk_') || v.type === 'unconnected_items';
+const electrical = (r: CheckReport) => r.violations.filter((v) => !isCosmetic(v)).length;
+
+/**
+ * Count a repair cycle only for a fix that did not work (SPEC §4 step 5, "fix and
+ * re-run"). Counting every failing run made the limit a cap on how often the agent
+ * looks (#331): layout-draft asks for a DRC after each batch of moves, and a board
+ * mid-placement is expected to fail. So a check costs nothing when
+ * - it passes, or has no failing check of the same kind before it (the first failure
+ *   after a clean check is an edit's own breakage, not a failed repair);
+ * - nothing was edited since the previous check (a re-run is not a repair);
+ * - its electrical findings went down.
+ * It costs a cycle when electrical findings remain and did not go down, or, once only
+ * cosmetic findings are left, when the total did not go down, so a stuck silkscreen
+ * or ratsnest loop still ends in rollback. A failing check blocks `finish` exactly as
+ * before; only the budget changes. The previous report comes from `ctx.priorChecks`,
+ * because `lastErc`/`lastDrc` are cleared on every edit, which is also how an edit
+ * since the last check is detected: call this before storing `report` there.
+ */
+export function countRepairCycle(ctx: RunContext, kind: 'erc' | 'drc', report: CheckReport): void {
+  const prior = (ctx.priorChecks ??= {});
+  const prev = prior[kind];
+  const editedSince = (kind === 'erc' ? ctx.lastErc : ctx.lastDrc) === null;
+  prior[kind] = report;
+  if (report.ok || !prev || prev.ok || !editedSince) return;
+  const before = electrical(prev);
+  const now = electrical(report);
+  if (now < before) return;
+  if (now > 0 || report.violations.length >= prev.violations.length) ctx.repairCycles++;
+}
 
 export interface HandlerOutcome {
   ok: boolean;
@@ -265,9 +301,9 @@ export const HANDLERS: HandlerDef[] = [
         return 'no schematic configured; ERC does not apply yet — skip it until a schematic exists and is set in .copperhead/config.json';
       const schPath = path.join(ctx.repoRoot, ctx.config.schematic);
       const report = await runErc(schPath);
+      countRepairCycle(ctx, 'erc', report);
       ctx.lastErc = report;
       if (report.ok) ctx.ledger.clear('erc');
-      else ctx.repairCycles++;
       const out = formatViolations(report);
       // A zero-symbol schematic passes ERC with 0 violations — a false green
       // (3.2) that lets a premature finish look verified (an empty sheet also
@@ -492,9 +528,9 @@ export const HANDLERS: HandlerDef[] = [
       if (!ctx.config.board)
         return 'no board configured; DRC does not apply yet — skip it until a board exists and is set in .copperhead/config.json';
       const report = await runDrc(path.join(ctx.repoRoot, ctx.config.board));
+      countRepairCycle(ctx, 'drc', report);
       ctx.lastDrc = report;
       if (report.ok) ctx.ledger.clear('drc');
-      else ctx.repairCycles++;
       return { ok: report.ok, text: formatViolations(report) };
     },
   },

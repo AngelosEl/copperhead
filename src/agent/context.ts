@@ -31,5 +31,11 @@ export interface RunContext {
   /** Last `check_drift` output; used by `generate_report` completion. */
   lastDrift?: string | null;
   repairCycles: number;
+  /**
+   * The most recent ERC and DRC reports, kept across edits. `lastErc`/`lastDrc`
+   * are cleared by any schematic or board edit (they mean "verified since the
+   * last edit"), so the repair budget compares against these instead (#331).
+   */
+  priorChecks?: { erc?: CheckReport; drc?: CheckReport };
   finishRequest: FinishRequest | null;
 }

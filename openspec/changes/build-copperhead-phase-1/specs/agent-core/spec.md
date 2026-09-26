@@ -25,11 +25,15 @@ Each `do` run SHALL follow the sequence: load memory (all `docs/*.md` + schemati
 - **THEN** the net is renamed in every sheet, PINOUT.md and SUBSYSTEMS.md are updated, ERC exits 0, exactly one commit exists, and no unrelated net or doc line changed
 
 ### Requirement: Turn and repair budgets
-The loop SHALL enforce `maxTurns` (default 40) and `maxRepairCycles` (default 5), log per-run token usage, and on unrecoverable failure restore the pre-run snapshot, print the transcript path, and exit 1.
+The loop SHALL enforce `maxTurns` (default 40) and `maxRepairCycles` (default 5), log per-run token usage, and on unrecoverable failure restore the pre-run snapshot, print the transcript path, and exit 1. A repair cycle SHALL be counted only for a fix that did not work: after an edit, a failing ERC/DRC whose electrical findings did not go down, or, when only silkscreen or unrouted findings remain, whose total did not go down. The first failure after a clean check, a re-run with no edit in between, and a check that makes progress SHALL NOT count.
 
 #### Scenario: Repair loop converges (AC-3.5)
 - **WHEN** an edit first produces an ERC violation
 - **THEN** the transcript shows the violation parsed, a targeted fix, a re-run, and a pass within `maxRepairCycles`
+
+#### Scenario: Routine checks do not spend the repair budget (#331)
+- **WHEN** a layout agent runs DRC after each batch of moves and each check has fewer electrical findings than the last, or only silkscreen findings that shrink
+- **THEN** no repair cycle is counted, and the run is not rolled back for exhausting `maxRepairCycles`
 
 #### Scenario: Rollback on exhaustion (AC-3.6)
 - **WHEN** violations persist after `maxRepairCycles`
