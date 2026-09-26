@@ -74,6 +74,13 @@ export interface RunOptions {
    * verification and sync obligations apply to them too.
    */
   preTouched?: string[];
+  /**
+   * The caller's own completion check for this run (a `create` stage's contract).
+   * `finish` consults it before answering "all gates satisfied", so a run is never
+   * told it is done by the tool and not done by the gate (#310). Returns null when
+   * met, else what is missing.
+   */
+  stageGate?: () => Promise<string | null>;
 }
 
 export interface RunResult {
@@ -274,6 +281,7 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     boardAtStart: null,
     repairCycles: 0,
     finishRequest: null,
+    ...(opts.stageGate ? { stageGate: opts.stageGate } : {}),
   };
   if (config.board) {
     try {

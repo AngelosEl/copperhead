@@ -32,6 +32,8 @@ export interface RunContext {
   boardAtStart?: string | null;
   /** Unrouted connections on `boardAtStart`, computed on the first run_drc. */
   unroutedBaseline?: number;
+  /** The caller's completion contract, checked by `finish` (see RunOptions.stageGate). */
+  stageGate?: () => Promise<string | null>;
   /** Last check_legibility counts; feeds the run summary's verification section. */
   lastLegibility: { error: number; advisory: number } | null;
   /** Last score composite (AC-16.21); recorded in the run summary. */

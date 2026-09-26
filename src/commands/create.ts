@@ -48,7 +48,8 @@ interface Stage {
   name: string;
   /** true when repo state shows the stage is already done (resume support). */
   isComplete: (repoRoot: string, docs: string) => Promise<boolean> | boolean;
-  prompt: (brief: string) => string;
+  /** `docs` is the configured docs dir, so a prompt names the exact path its gate reads (#310). */
+  prompt: (brief: string, docs: string) => string;
 }
 
 const docExists = (repoRoot: string, rel: string) => existsSync(path.join(repoRoot, rel));
@@ -272,8 +273,13 @@ export const STAGES: Stage[] = [
       // not resume as complete and get its board committed unverified
       return boardDrcOk(root, config.board);
     },
-    prompt: () =>
-      'Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn; a board it has just written passed DRC and starts fully unrouted, and when the stage resumes on a board populated earlier, run run_drc first to see where it stands). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint\'s (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief\'s envelope. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares every footprint and pad net against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed, but a run that ends with more unrouted connections than the board started with fails, since that means a connection was broken — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. The populated board counts as this stage\'s edit, so finishing needs a clean run_drc, run_erc, and check_drift even if you move nothing. Then write the "## Draft quality" section in LAYOUT.md: exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.',
+    prompt: (_brief, docs) => {
+      // posix: this path is shown to the model, and must read the same on Windows
+      const layoutDoc = path.posix.join(docs, 'LAYOUT.md');
+      return (
+        `Stage 5: first-draft layout. Every schematic part is already on the board with its exact library footprint, pad nets assigned, packed on a grid inside the outline (the populate step did this from the schematic before your first turn; a board it has just written passed DRC and starts fully unrouted, and when the stage resumes on a board populated earlier, run run_drc first to see where it stands). Your job is placement and routing, not geometry: move and rotate each part with move_footprint (never hand-edit a footprint's (at …): KiCad stores pad angles as absolute, so a hand rotation leaves the pads facing the old way and shorts them), and resize the Edge.Cuts outline to the brief's envelope. Everything else on the board is an anchored edit_file on the .kicad_pcb, and that is expected, not a workaround: tracks, vias, zones, the outline, and the (at …) inside a part's Reference or Value property (the label's own position, not the footprint's), which is how a silkscreen overlap is fixed. Rules: connectors on edges, decoupling at IC pins, ESD at connectors, keepouts honored. Never add, delete, or rewrite a footprint, pad, or net — the stage gate compares every footprint and pad net against the schematic and fails on any difference. Route power and short critical nets; leave the rest as ratsnest. Run run_drc after each batch of moves: it must be clean, and it reports unrouted connections as a count, not a failure — leaving nets as ratsnest is allowed, but a run that ends with more unrouted connections than the board started with fails, since that means a connection was broken — and findings inside a single library footprint (its own pads and holes) as a separate list you cannot fix and must not try to: name them in Draft quality. The populated board counts as this stage's edit, so finishing needs a clean run_drc, run_erc, and check_drift even if you move nothing. Then write the "## Draft quality" section in ${layoutDoc} (that exact repo-relative path; a LAYOUT.md anywhere else, including the repository root, is not read): exactly what is fine, how many connections are still unrouted, and what a human or specialist tool should redo. Non-optimal is acceptable; unlabeled non-optimal is not.`
+      );
+    },
   },
   {
     name: 'outputs',
@@ -457,6 +463,22 @@ async function populateStop(opts: CreateOptions): Promise<string | null> {
   }
 }
 
+/**
+ * What is wrong with the layout document, or null when it has its Draft quality
+ * section. Names the path the gate reads, and the stray root file when that is the
+ * cause (#310): a model that can see the section in its own LAYOUT.md cannot find
+ * a gap reported as just "LAYOUT.md".
+ */
+export async function layoutDocGap(root: string, docs: string): Promise<string | null> {
+  const layoutDoc = path.posix.join(docs, 'LAYOUT.md');
+  if (await docHasContent(root, layoutDoc, '## Draft quality')) return null;
+  const stray = layoutDoc !== 'LAYOUT.md' && (await docHasContent(root, 'LAYOUT.md', '## Draft quality'));
+  return (
+    `${layoutDoc} has no "## Draft quality" section` +
+    (stray ? `; the section was written to LAYOUT.md at the repository root, which this stage does not read: put it in ${layoutDoc}` : '')
+  );
+}
+
 async function contractGapDetail(stageName: string, root: string, config: CopperheadConfig): Promise<string> {
   const generic = 'the run finished but the stage completion contract is not met — no usable artifact was produced';
   if (stageName === 'part-selection') {
@@ -476,9 +498,10 @@ async function contractGapDetail(stageName: string, root: string, config: Copper
     if (!m.ok) {
       return `the layout-draft contract is not met: ${m.detail}; restore the populated footprints (never add or rewrite them) and move them instead`;
     }
-    return (await docHasContent(root, path.join(fresh.docs, 'LAYOUT.md'), '## Draft quality'))
-      ? 'the layout-draft contract is not met: the board does not pass DRC; run run_drc and fix what it reports before finishing'
-      : 'the layout-draft contract is not met: LAYOUT.md has no "## Draft quality" section';
+    const docGap = await layoutDocGap(root, fresh.docs);
+    return docGap
+      ? `the layout-draft contract is not met: ${docGap}`
+      : 'the layout-draft contract is not met: the board does not pass DRC; run run_drc and fix what it reports before finishing';
   }
   if (stageName !== 'schematic' || !config.schematic) return generic;
   const p = path.join(root, config.schematic);
@@ -982,7 +1005,7 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
     // stops and reports for a human — the loop keeps going by itself for the
     // recoverable cases without silently spinning on the dead-end ones.
     const stageTurns = config.stageMaxTurns?.[stage.name];
-    const basePrompt = stage.prompt(brief);
+    const basePrompt = stage.prompt(brief, config.docs);
     let guidance = '';
     let stageDone = false;
     let stageTranscriptDir = '';
@@ -1079,6 +1102,16 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
           // the populated board is this stage's mutation too: finish needs a
           // passing DRC on it even when the agent never edits the board
           ...(layoutBoard ? { preTouched: [layoutBoard] } : {}),
+          // #310: in layout-draft, finish checks the stage's own contract, so the agent
+          // hears what is missing while its board still exists, not after the rollback.
+          // Other stages keep ending at the post-run check: their gaps have no specific
+          // message yet, and a generic one would only spend turns.
+          ...(stage.name === 'layout-draft'
+            ? {
+                stageGate: async () =>
+                  (await stage.isComplete(opts.repoRoot, config.docs)) ? null : contractGapDetail(stage.name, opts.repoRoot, config),
+              }
+            : {}),
           ...(stageTurns !== undefined ? { maxTurns: stageTurns } : {}),
           ...(opts.onBudgetExhausted ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
           log: opts.log,

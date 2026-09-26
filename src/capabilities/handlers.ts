@@ -886,6 +886,13 @@ export const HANDLERS: HandlerDef[] = [
       if (blocking.length) {
         problems.push('open sync obligations:\n' + blocking.map((o) => `  - [${o.kind}] ${o.detail}`).join('\n'));
       }
+      // Only once the cheap gates pass: the stage contract can re-run ERC/DRC. A gate
+      // that throws is reported, never treated as met (#310: finish must not approve
+      // what the pipeline then rejects).
+      if (!problems.length && ctx.stageGate) {
+        const gap = await ctx.stageGate().catch((e: unknown) => `the stage contract could not be checked: ${(e as Error).message}`);
+        if (gap) problems.push(gap);
+      }
       if (problems.length) {
         return `cannot finish yet:\n${problems.map((p) => `- ${p}`).join('\n')}`;
       }

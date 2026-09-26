@@ -160,6 +160,25 @@ describe('create layout-draft around board populate (#314)', () => {
     }
   }, 180_000);
 
+  it('hands the layout stage a finish-time gate that names the layout document it reads (#310)', async () => {
+    const { repo, brief, cleanup } = await projectAtLayoutDraft();
+    try {
+      let gap: string | null | undefined;
+      layout.attempts = [
+        async (opts) => {
+          // asked mid-stage, on the populated board: the only gap is the missing document
+          gap = await opts.stageGate?.();
+          return 'failure';
+        },
+      ];
+      await run(repo, brief);
+      expect(typeof layout.calls[0]?.stageGate).toBe('function');
+      expect(gap).toContain('docs/LAYOUT.md has no "## Draft quality" section');
+    } finally {
+      await cleanup();
+    }
+  }, 180_000);
+
   it('the populated board counts as touched by the run, so finish needs a passing DRC on it', async () => {
     const { repo, brief, cleanup } = await projectAtLayoutDraft();
     try {
