@@ -90,3 +90,10 @@
 - [x] 12.7 An outline populate cannot grow must hold every packed part inside its real shape (L-shapes, cutouts)
 - [x] 12.8 Tests: a seeded KiCad config for the pipeline tests (`seededKicadConfig`), platform pinned in the path-variable tests, a loop-level `preTouched` test
 - [x] 12.9 SPEC.md AC-15.30/36/38/39/41/42/43, the populate bullet, delta specs, design D2/D4/D6/D8
+
+## 13. Codex review of d4bdbd7
+
+- [x] 13.1 Symbols from a project library are read in place, never vendored, so the user's `sym-lib-table` row stays the source; test: a second draft reaches another symbol in the same library, and ERC reports no `lib_symbol_mismatch`
+- [x] 13.2 Populate remaps every object id inside a placed footprint per instance, deterministically; test: two instances of a stock footprint with nested ids share none, and DRC reports no mismatch
+- [x] 13.3 The missing-footprint stop runs before the KiCad project is scaffolded, so it writes no KiCad file; test asserts no scaffold files after the stop
+- [x] 13.4 SPEC.md AC-15.31/32/36, delta specs, design D1/D7

@@ -28,7 +28,7 @@ A footprint id `Lib:Name` SHALL resolve only to `Name.kicad_mod` inside the libr
 
 ### Requirement: The run stops for an uninstalled footprint
 
-Before the schematic stage's first agent turn, every BOM.md Footprint cell SHALL resolve. When any does not, `create` SHALL exit non-zero without a model turn, a retry diagnosis, or a KiCad write, and print a message naming every unresolved part (refdes, requested id, whether the library or only the footprint is missing, and the closest installed names), the `fp-lib-table` row to add, the global install route, the sources searched, and that re-running `create` resumes. The message SHALL NOT contain an absolute path. A placeholder cell (`-`, `N/A`, `TBD`, empty) SHALL be reported as unassigned.
+Before the schematic stage's first agent turn, every BOM.md Footprint cell SHALL resolve. When any does not, `create` SHALL exit non-zero without a model turn, a retry diagnosis, or a KiCad write (the check SHALL run before the KiCad project is scaffolded), and print a message naming every unresolved part (refdes, requested id, whether the library or only the footprint is missing, and the closest installed names), the `fp-lib-table` row to add, the global install route, the sources searched, and that re-running `create` resumes. The message SHALL NOT contain an absolute path. A placeholder cell (`-`, `N/A`, `TBD`, empty) SHALL be reported as unassigned.
 
 #### Scenario: Missing module footprint stops the run
 
@@ -56,7 +56,7 @@ The `check_footprints` tool SHALL resolve footprint ids exactly as the board pop
 
 ### Requirement: Board populate before layout-draft
 
-Before each layout-draft attempt, the pipeline SHALL place every schematic part on the board: one footprint per netlist component (power symbols and parts excluded from the board omitted), with the schematic's refdes, value, and footprint id, pad geometry byte-identical to the library file, every pad's net equal to the schematic netlist's, and a schematic path link. It SHALL write the board only after KiCad loads the result, and a board it wrote SHALL pass DRC before the agent's first turn, or the run SHALL stop, naming the findings (and a missing global `fp-lib-table` when KiCad cannot find the libraries). An unresolved footprint, or a netlist pin with no matching pad in its footprint, SHALL stop the run and leave the board byte-identical. A KiCad 5 `(module …)` library file SHALL populate like a current one. A footprint's own zones, which a board stores in board coordinates, SHALL move to its position. When the parts do not fit a single-rectangle outline, that outline SHALL grow roughly square; with any other outline, every packed part SHALL lie inside its real shape (cutouts included), or the run SHALL stop. The scaffold project SHALL allow 0.2 mm holes, which stock QFN thermal vias use, and its custom rules SHALL hold board vias to a 0.3 mm drill. A board already holding exactly the schematic's footprints on the schematic's nets SHALL be left unchanged; a board holding different footprints, or pads on other nets, SHALL be refused, not rewritten. Populating the same schematic twice SHALL produce byte-identical boards, independent of the process locale.
+Before each layout-draft attempt, the pipeline SHALL place every schematic part on the board: one footprint per netlist component (power symbols and parts excluded from the board omitted), with the schematic's refdes, value, and footprint id, pad geometry byte-identical to the library file, every pad's net equal to the schematic netlist's, and a schematic path link. It SHALL write the board only after KiCad loads the result, and a board it wrote SHALL pass DRC before the agent's first turn, or the run SHALL stop, naming the findings (and a missing global `fp-lib-table` when KiCad cannot find the libraries). An unresolved footprint, or a netlist pin with no matching pad in its footprint, SHALL stop the run and leave the board byte-identical. A KiCad 5 `(module …)` library file SHALL populate like a current one. A footprint's own zones, which a board stores in board coordinates, SHALL move to its position. Every object id inside a placed footprint SHALL be unique on the board, derived deterministically from the instance. When the parts do not fit a single-rectangle outline, that outline SHALL grow roughly square; with any other outline, every packed part SHALL lie inside its real shape (cutouts included), or the run SHALL stop. The scaffold project SHALL allow 0.2 mm holes, which stock QFN thermal vias use, and its custom rules SHALL hold board vias to a 0.3 mm drill. A board already holding exactly the schematic's footprints on the schematic's nets SHALL be left unchanged; a board holding different footprints, or pads on other nets, SHALL be refused, not rewritten. Populating the same schematic twice SHALL produce byte-identical boards, independent of the process locale.
 
 The populated board SHALL be the stage's own mutation: the stage's agent run SHALL count the board as touched, so finishing requires a passing `run_drc`; each retry SHALL start from the pre-stage board, re-populated; and a stage that does not complete (a stop, an abort, exhausted retries, or an error) SHALL leave the last verified board: the pre-stage board, or, when an attempt committed, that commit's board.
 
@@ -79,6 +79,11 @@ The populated board SHALL be the stage's own mutation: the stage's agent run SHA
 
 - **WHEN** an attempt committed its board, the stage contract then failed, and the diagnosis stops the stage
 - **THEN** the board equals HEAD's board and the tree does not revert the commit
+
+#### Scenario: Two instances of one footprint
+
+- **WHEN** two parts use a library footprint whose pads and graphics carry ids
+- **THEN** no id repeats on the board, and a second populate writes the same bytes
 
 #### Scenario: A module's keepout zone moves with it
 

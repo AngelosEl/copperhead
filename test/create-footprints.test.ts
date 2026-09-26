@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
-import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import type { RunOptions, RunResult } from '../src/agent/loop.js';
 import { tempFixtureRepo } from './helpers.js';
@@ -109,6 +109,8 @@ describe('create stops for an uninstalled footprint (#314)', () => {
       expect(log).toContain('no library named "Espressif"');
       expect(log).not.toMatch(/R1\s+Resistor_SMD/); // the installed part is not reported
       expect(log).toContain('resumes at the schematic stage');
+      // the stop writes no KiCad file: the scaffold comes only after the gate (AC-15.32)
+      expect((await readdir(repo)).filter((f) => /\.kicad_(sch|pcb|pro|dru)$/.test(f))).toEqual([]);
 
       // the user installs the module's footprint project-locally, then re-runs
       const stock = (await footprintSearchDirs())[0]!;

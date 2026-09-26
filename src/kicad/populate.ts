@@ -235,6 +235,14 @@ export function instantiateFootprint(modText: string, inst: Instance): string {
     // library-only header lines, and the KiCad 5 edit timestamps (`tedit`,
     // `tstamp`) a board no longer carries
     if (['version', 'generator', 'generator_version', 'uuid', 'at', 'tedit', 'tstamp'].includes(s.tag)) continue;
+    // Object ids inside the footprint (pads, graphics, zones; about a fifth of
+    // the stock library carries them) must be unique on the board, and two
+    // instances of one footprint would otherwise share every one. KiCad gives
+    // a placed footprint fresh ids; these are derived from the instance's own
+    // uuid and the library's id, so a re-populate still writes the same bytes.
+    t = t
+      .replace(/\(uuid\s+"([^"]+)"\)/g, (_, id: string) => `(uuid ${q(uuidv5(`${inst.uuid}/${id}`))})`)
+      .replace(/\(tstamp\s+"?([0-9A-Fa-f-]+)"?\)/g, (_, id: string) => `(tstamp ${uuidv5(`${inst.uuid}/${id}`)})`);
     if (s.tag === 'property' || s.tag === 'fp_text') {
       // a KiCad 5 library writes the refdes and value unquoted (`REF**`)
       const token = '(?:"(?:[^"\\\\]|\\\\.)*"|[^\\s()"]+)';

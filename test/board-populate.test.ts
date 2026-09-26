@@ -8,7 +8,8 @@ import { bootstrapKicadProject } from '../src/kicad/bootstrap.js';
 import { draftSchematic, symLibTableRows } from '../src/kicad/draft/draft.js';
 import { exportNetlist, resolveKicadCli } from '../src/kicad/cli.js';
 import { expandUri, libTableRows } from '../src/kicad/libtable.js';
-import { kicadLoadError, runDrc } from '../src/kicad/cli.js';
+import { kicadLoadError, runDrc, runErc } from '../src/kicad/cli.js';
+import { childSpans } from '../src/kicad/spans.js';
 import { unroutedGuard } from '../src/capabilities/handlers.js';
 import { seededKicadConfig } from './helpers.js';
 import { FootprintResolver, footprintSearchDirs, formatMissingFootprints, missingFootprints } from '../src/kicad/footprints.js';
@@ -590,6 +591,41 @@ describe('project symbol libraries (AC-15.31)', () => {
     }
   });
 
+  it('a project library stays the source after a draft uses it, so its other symbols stay reachable', async () => {
+    const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-symtable-'));
+    try {
+      await mkdir(path.join(repo, '.copperhead'), { recursive: true });
+      const sch = await bootstrapKicadProject(repo, '# Demo board');
+      await cp(path.join(DRAFT_FIXTURE, 'docs'), path.join(repo, 'docs'), { recursive: true });
+      // UserLib, named only in the project table, holds two of the fixture's symbols
+      const mcu = await readFile(path.join(SYMLIB, 'CopperMCU.kicad_sym'), 'utf8');
+      const conn = await readFile(path.join(SYMLIB, 'CopperConn.kicad_sym'), 'utf8');
+      const connSym = childSpans(conn, conn.indexOf('(kicad_symbol_lib')).find((x) => x.tag === 'symbol')!;
+      await mkdir(path.join(repo, 'lib'));
+      await writeFile(path.join(repo, 'lib', 'UserLib.kicad_sym'), `${mcu.slice(0, mcu.lastIndexOf(')'))}\t${conn.slice(connSym.start, connSym.end)}\n)\n`, 'utf8');
+      const row = '(lib (name "UserLib")(type "KiCad")(uri "${KIPRJMOD}/lib/UserLib.kicad_sym")(options "")(descr "user"))';
+      await writeFile(path.join(repo, 'sym-lib-table'), `(sym_lib_table\n\t(version 7)\n\t${row}\n)\n`, 'utf8');
+      const intent = await readFile(path.join(DRAFT_FIXTURE, 'schematic.intent.json'), 'utf8');
+      const draft = async (text: string): ReturnType<typeof draftSchematic> => {
+        await writeFile(path.join(repo, 'schematic.intent.json'), text, 'utf8');
+        return draftSchematic({ repoRoot: repo, schematic: sch!, intentPath: 'schematic.intent.json', docsDir: path.join(repo, 'docs'), symbolDirs: [SYMLIB] });
+      };
+      const first = intent.replace('"CopperMCU:MCU8"', '"UserLib:MCU8"');
+      expect((await draft(first)).ok).toBe(true);
+      const table = await readFile(path.join(repo, 'sym-lib-table'), 'utf8');
+      expect(table).toContain(row);
+      expect(symLibTableRows(table).filter((r) => r.name === 'UserLib')).toHaveLength(1);
+      // the next draft reaches another symbol in the same library
+      const second = await draft(first.replace('"CopperConn:Conn_01x03"', '"UserLib:Conn_01x03"'));
+      expect(second.ok ? '' : second.message).toBe('');
+      // and KiCad sees the sheet's symbols as the library's own
+      const erc = await runErc(path.join(repo, sch!));
+      expect(erc.violations.filter((v) => v.type === 'lib_symbol_mismatch')).toEqual([]);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it('a project in a subfolder resolves a library named in the sym-lib-table beside its schematic', async () => {
     const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-symtable-'));
     try {
@@ -799,6 +835,42 @@ describe('populate edge cases (#314)', () => {
       await rm(repo, { recursive: true, force: true });
     }
   }, 120_000);
+
+  it('gives every object inside a placed footprint its own id, so two instances of one footprint share none', async () => {
+    const repo = await mkdtemp(path.join(tmpdir(), 'copperhead-ids-'));
+    try {
+      await mkdir(path.join(repo, '.copperhead'), { recursive: true });
+      await bootstrapKicadProject(repo, '# Demo board');
+      const board = path.join(repo, PCB);
+      const scaffold = await readFile(board, 'utf8');
+      const id = 'MountingHole:MountingHole_4.3x6.2mm_M4_Pad';
+      const mod = await readFile(path.join(stock, 'MountingHole.pretty', 'MountingHole_4.3x6.2mm_M4_Pad.kicad_mod'), 'utf8');
+      expect((mod.match(/\(uuid /g) ?? []).length).toBeGreaterThan(1); // the library carries nested ids
+      const inst = (ref: string, x: number, k: number): string =>
+        instantiateFootprint(mod, {
+          fpId: id,
+          ref,
+          value: 'MountingHole',
+          uuid: `00000000-0000-0000-0000-00000000000${k}`,
+          at: { x, y: 110 },
+          path: `/${ref}`,
+          sheetname: '/',
+          sheetfile: 'demo-board.kicad_sch',
+          padNet: () => undefined,
+        });
+      const text = `${scaffold.slice(0, scaffold.lastIndexOf(')'))}${inst('H1', 108, 1)}\n${inst('H2', 122, 2)}\n)\n`;
+      const ids = [...text.matchAll(/\(uuid "([^"]+)"\)/g)].map((m) => m[1]);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(inst('H1', 108, 1)).toBe(inst('H1', 108, 1)); // deterministic
+      await writeFile(board, text, 'utf8');
+      const out = path.join(repo, 'drc.json');
+      await execa(resolveKicadCli(), ['pcb', 'drc', '--format', 'json', '--output', out, board], { reject: false, env: seeded() });
+      const raw = JSON.parse(await readFile(out, 'utf8')) as { violations: { type: string }[] };
+      expect(raw.violations.filter((v) => v.type === 'lib_footprint_mismatch')).toEqual([]);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
 
   /** Replace the scaffold's gr_rect outline with Edge.Cuts lines around `c`, plus any extra items. */
   const polyOutline = (text: string, c: number[][], extra = ''): string => {

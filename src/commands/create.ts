@@ -940,6 +940,19 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
     // before the stage runs, so there is a schematic to populate and the stage
     // contract can eventually be met. No-op once a project exists.
     if (stage.name === 'schematic') {
+      // A footprint that is not installed stops the run for the user (#314):
+      // no model turn can install a library, and a substitute package is
+      // exactly the surrogate geometry this gate exists to keep off the board.
+      // It runs before the scaffold, so the stop writes no KiCad file
+      // (AC-15.32); a stage already complete is resumed past as before.
+      const stop = await bomFootprintStop(opts.repoRoot, config);
+      if (stop && !(await stage.isComplete(opts.repoRoot, config.docs))) {
+        opts.log(stageLine(stage.name, `create stopped: ${stop}`, 'err'));
+        logResumePoint(opts, stage, i);
+        printCostTable(opts, stageCosts);
+        await writeRunReport(opts, stageCosts);
+        return { ok: false, completed };
+      }
       const created = await bootstrapKicadProject(opts.repoRoot, brief);
       if (created) {
         opts.log(stageLine('schematic', `scaffolded empty KiCad project (${created} + board + project), wired into config`));
@@ -961,17 +974,6 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
       stageCosts.push({ name: stage.name, resumed: true, wallMs: 0, turns: 0, tokensIn: 0, tokensOut: 0, cacheHits: 0 });
       await emitJlcpcbAfterOutputs(stage.name, opts);
       continue;
-    }
-    // A footprint that is not installed stops the run for the user (#314): no
-    // model turn can install a library, and a substitute package is exactly
-    // the surrogate geometry this gate exists to keep off the board.
-    const stop = stage.name === 'schematic' ? await bomFootprintStop(opts.repoRoot, config) : null;
-    if (stop) {
-      opts.log(stageLine(stage.name, `create stopped: ${stop}`, 'err'));
-      logResumePoint(opts, stage, i);
-      printCostTable(opts, stageCosts);
-      await writeRunReport(opts, stageCosts);
-      return { ok: false, completed };
     }
     // Auto-recovery loop: run the stage, and if it fails or ends without meeting
     // its contract, ask the model to diagnose whether another attempt is likely

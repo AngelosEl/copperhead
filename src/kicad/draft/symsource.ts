@@ -416,13 +416,20 @@ export class SymbolSource {
     const vendored = path.join(this.cacheDir(), vendorFileName(lib));
     let block: string | null = null;
     let fromInstalled = false;
+    // a library the project's own sym-lib-table names is already project-local:
+    // it is read in place, never copied into the vendored cache, so the user's
+    // row stays the source and every symbol in it stays reachable (a partial
+    // cache under the same nickname would shadow the rest)
+    let fromProject = false;
     if (existsSync(vendored)) {
       block = extractSymbolBlock(await readFile(vendored, 'utf8'), name);
       if (block) this.libs.add(lib);
     }
     if (!block) {
       const dirs = this.searchDirs ?? (await symbolSearchDirs());
-      const file = (await this.projectLibrary(lib)) ?? (await findLibraryFile(lib, dirs));
+      const project = await this.projectLibrary(lib);
+      fromProject = project !== null;
+      const file = project ?? (await findLibraryFile(lib, dirs));
       if (!file) {
         const elsewhere = await crossLibrarySuggestions(name, lib, dirs);
         if (elsewhere.length) throw new SymbolResolutionError(libId, 'found-elsewhere', elsewhere);
@@ -448,12 +455,12 @@ export class SymbolSource {
         throw new SymbolResolutionError(libId, 'no-symbol', candidates);
       }
       fromInstalled = true;
-      this.libs.add(lib);
+      if (!fromProject) this.libs.add(lib);
     }
 
     const node = parseSymbolNode(block);
     const inherited = await this.inherit(libId, lib, node, depth);
-    if (fromInstalled && this.vendor) {
+    if (fromInstalled && this.vendor && !fromProject) {
       // Derived symbols vendor FLATTENED under their own name, never as the
       // library's `extends` stub. A vendored stub makes the project
       // sym-lib-table resolve the derived name to base-geometry-plus-derived-

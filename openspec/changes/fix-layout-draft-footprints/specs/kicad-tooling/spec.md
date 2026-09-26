@@ -23,7 +23,7 @@ Schematic IR validation SHALL refuse a part whose `footprint` differs from its B
 
 ### Requirement: Project symbol libraries
 
-Symbol resolution SHALL consult the project `sym-lib-table` beside the schematic (with `${KIPRJMOD}` expanded to that directory) before the stock symbol directories, skipping rows that point into copperhead's vendored cache. Drafting SHALL keep every row a user added to `sym-lib-table` verbatim, whatever its layout, when it rewrites the vendored rows, and SHALL refuse to rewrite a table it cannot parse, leaving it unchanged.
+Symbol resolution SHALL consult the project `sym-lib-table` beside the schematic (with `${KIPRJMOD}` expanded to that directory) before the stock symbol directories, skipping rows that point into copperhead's vendored cache. Symbols from a project library SHALL be read in place and SHALL NOT be copied into the vendored cache, so the user's row stays the library's source. Drafting SHALL keep every row a user added to `sym-lib-table` verbatim, whatever its layout, when it rewrites the vendored rows, and SHALL refuse to rewrite a table it cannot parse, leaving it unchanged.
 
 #### Scenario: Project-only symbol library resolves
 
@@ -49,3 +49,8 @@ Symbol resolution SHALL consult the project `sym-lib-table` beside the schematic
 
 - **WHEN** the schematic lives in `hardware/` and its library is named only in `hardware/sym-lib-table`
 - **THEN** the symbol resolves from that library
+
+#### Scenario: A used project library stays the source
+
+- **WHEN** a draft uses one symbol from a project-only library, and a later draft uses another symbol from it
+- **THEN** the user's row still points at the library after the first draft, and the second draft resolves
