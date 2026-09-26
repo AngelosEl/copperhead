@@ -5,7 +5,7 @@ Parts: 84  Nets: 95
 
 ## Drafted
 
-Paper: A0  Wires: 478  Labels: 204
+Paper: A1  Wires: 499  Labels: 190
 
 ## Netlist comparison
 
