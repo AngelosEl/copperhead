@@ -30,6 +30,15 @@ export interface Turn {
    * a near-miss simply never set it.
    */
   nudge?: string;
+  /**
+   * A correction for a turn whose reply was cut short (#320): the model wrote
+   * harness-only blocks (`[result of …]`, `[user]`) after its tool calls, so
+   * that tail was discarded. The loop sends it to the model with the results of
+   * the calls that did run. Text-protocol providers set it; others never do.
+   */
+  notice?: string;
+  /** The text that was cut with it, for the transcript only (never sent to the model). */
+  discarded?: string;
 }
 
 export interface ChatOpts {

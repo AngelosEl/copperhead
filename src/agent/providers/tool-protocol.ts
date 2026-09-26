@@ -74,7 +74,22 @@ export interface ParsedToolTurn {
   text: string | null;
   toolCalls: ToolCall[];
   nudge?: string;
+  /** Set when the reply wrote harness-only blocks and its tail was discarded (#320). */
+  notice?: string;
+  /** The discarded tail, verbatim, for the transcript only; never sent back to the model. */
+  discarded?: string;
 }
+
+/**
+ * A line the harness writes and the model never may: a tool result or a user turn, in the
+ * exact form `renderConversation` and `renderDelta` use. A model that continues past its
+ * own tool call in that form is inventing the result (#320, register I15), so the reply is
+ * cut at the first one.
+ */
+const HARNESS_MARKER = /^[ \t]*\[(?:result of [A-Za-z0-9_.:-]+|user)\][ \t]*$/m;
+const HARNESS_MARKER_ALL = new RegExp(HARNESS_MARKER.source, 'gm');
+/** History markers that are harmless to write but must not be replayed as the model's prose. */
+const ECHOED_MARKER_LINES = /^[ \t]*\[(?:assistant|assistant tool call)\][ \t]*$\n?/gm;
 
 /**
  * Detect a malformed-but-intended tool call in a turn that dispatched none
@@ -138,6 +153,71 @@ export function parseToolCalls(
   catalog: Set<string>,
 ): ParsedToolTurn {
   if (!text) return { text: null, toolCalls: [] };
+
+  // #320: the model sometimes writes past its tool call in the transcript format, inventing
+  // the `[result of …]` it never received, then more calls planned against that invention.
+  // Only what precedes the first harness-only line is the model's turn; the rest is dropped,
+  // not dispatched and not stored, and the notice tells the model so. On a resumed CLI
+  // session the provider keeps the raw reply, so the notice is also the only correction the
+  // model's own history gets.
+  let notice: string | undefined;
+  let discarded: string | undefined;
+  const cut = text.search(HARNESS_MARKER);
+  if (cut >= 0) {
+    const tail = text.slice(cut);
+    const fabricated = (tail.match(HARNESS_MARKER_ALL) ?? []).length;
+    const dropped = extractCalls(tail, () => 'dropped', catalog).toolCalls.length;
+    text = text.slice(0, cut);
+    discarded = tail;
+    notice =
+      `Your last reply contained ${fabricated} "[result of …]" or "[user]" block${fabricated === 1 ? '' : 's'} ` +
+      'that you wrote yourself. Only copperhead writes those: real tool results arrive in the next message. ' +
+      `Everything from the first such block on was discarded${dropped ? `, including ${dropped} tool call${dropped === 1 ? '' : 's'} that did not run` : ''}. ` +
+      'Treat any result you wrote yourself as unknown, and end each reply after your tool calls.';
+  }
+
+  const { toolCalls, matched } = extractCalls(text, nextId, catalog);
+
+  if (!toolCalls.length) {
+    // No call dispatched — but did the model clearly *intend* one? A fenced
+    // ```json block that names a catalog tool yet produced zero calls is a
+    // malformed near-miss (unbalanced braces, a missing `}`, or an inner object
+    // with no `tool` key). Silently dropping it gives the model no signal, so it
+    // misreads "no result" as "this tool is broken" and can bake that false
+    // conclusion into a committed summary (#I10). Surface a nudge instead. A
+    // discarded fabricated tail outranks it: that is what the model must fix first.
+    const clean = text.replace(ECHOED_MARKER_LINES, '');
+    return {
+      text: clean.trim() ? clean : null,
+      toolCalls,
+      nudge: notice ?? detectMalformedCall(text, catalog),
+      ...(notice ? { notice, discarded } : {}),
+    };
+  }
+
+  // Prose is whatever survives once the tool-call objects (and any now-empty
+  // ```json fences around them) are removed.
+  let prose = '';
+  let cursor = 0;
+  for (const [start, end] of matched) {
+    prose += text.slice(cursor, start);
+    cursor = end;
+  }
+  prose += text.slice(cursor);
+  prose = prose
+    .replace(ECHOED_MARKER_LINES, '')
+    .replace(/```(?:json)?\s*```/gi, '')
+    .replace(/```(?:json)?\s*$/gi, '')
+    .trim();
+  return { text: prose.length ? prose : null, toolCalls, ...(notice ? { notice, discarded } : {}) };
+}
+
+/** Every catalog tool call in `text`, with the spans it occupied. */
+function extractCalls(
+  text: string,
+  nextId: () => string,
+  catalog: Set<string>,
+): { toolCalls: ToolCall[]; matched: Array<[number, number]> } {
   const toolCalls: ToolCall[] = [];
   const matched: Array<[number, number]> = [];
 
@@ -165,28 +245,7 @@ export function parseToolCalls(
     }
     searchFrom = span.end;
   }
-
-  if (!toolCalls.length) {
-    // No call dispatched — but did the model clearly *intend* one? A fenced
-    // ```json block that names a catalog tool yet produced zero calls is a
-    // malformed near-miss (unbalanced braces, a missing `}`, or an inner object
-    // with no `tool` key). Silently dropping it gives the model no signal, so it
-    // misreads "no result" as "this tool is broken" and can bake that false
-    // conclusion into a committed summary (#I10). Surface a nudge instead.
-    return { text: text.trim() ? text : null, toolCalls, nudge: detectMalformedCall(text, catalog) };
-  }
-
-  // Prose is whatever survives once the tool-call objects (and any now-empty
-  // ```json fences around them) are removed.
-  let prose = '';
-  let cursor = 0;
-  for (const [start, end] of matched) {
-    prose += text.slice(cursor, start);
-    cursor = end;
-  }
-  prose += text.slice(cursor);
-  prose = prose.replace(/```(?:json)?\s*```/gi, '').replace(/```(?:json)?\s*$/gi, '').trim();
-  return { text: prose.length ? prose : null, toolCalls };
+  return { toolCalls, matched };
 }
 
 /**

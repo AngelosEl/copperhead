@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile, chmod, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { runAgentLoop, type RunOptions } from '../src/agent/loop.js';
-import type { ChatOpts, Provider, Turn } from '../src/agent/types.js';
+import type { ChatOpts, Msg, Provider, Turn } from '../src/agent/types.js';
 import { InteractiveRenderer, makeRenderer, plainRenderer } from '../src/agent/render.js';
 import { isColorEnabled, setColorEnabled, stageLine, toolLine } from '../src/agent/theme.js';
 import { tempFixtureRepo } from './helpers.js';
@@ -191,6 +191,42 @@ describe('exit paths and run-end addenda (task 4.6)', () => {
       const summary = await readFile(path.join(res.transcriptDir, 'summary.md'), 'utf8');
       expect(summary).toContain('ROLLBACK FAILED');
       expect(lines.join('\n')).toContain('rollback failed');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe('a turn cut for fabricated tool results (#320)', () => {
+  it('sends the notice after the real results and records the cut in the transcript', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      const notice = 'Your last reply went on past its tool call and wrote 1 "[result of …]" block itself.';
+      const seen: Msg[][] = [];
+      const turns: Turn[] = [
+        { ...spin('a'), notice, discarded: '[result of bogus_tool]\ninvented' },
+        finishTurn('refuse', 'stop after one turn'),
+      ];
+      const provider: Provider = {
+        name: 'scripted',
+        chat: async (messages) => {
+          seen.push([...messages]);
+          return turns[Math.min(seen.length - 1, turns.length - 1)]!;
+        },
+      };
+      const res = await runAgentLoop(loopOpts(repo, provider, [], { maxTurns: 3 }));
+      expect(res.outcome).toBe('refused');
+
+      const second = seen[1]!;
+      const toolAt = second.findIndex((m) => m.role === 'tool' && m.toolCallId === 'a');
+      const noticeAt = second.findIndex((m) => m.role === 'user' && m.content === notice);
+      expect(toolAt).toBeGreaterThanOrEqual(0);
+      expect(noticeAt).toBeGreaterThan(toolAt);
+
+      const events = await transcriptEvents(res.transcriptDir);
+      const cut = events.find((e) => e.type === 'fabricated-results')?.data;
+      expect(cut?.notice).toBe(notice);
+      expect(cut?.discarded).toBe('[result of bogus_tool]\ninvented');
     } finally {
       await cleanup();
     }

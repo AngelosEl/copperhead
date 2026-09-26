@@ -593,6 +593,9 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     tokensOut += res.usage.outputTokens;
     perTurn.push({ turn: turn + 1, in: res.usage.inputTokens, out: res.usage.outputTokens });
     await transcript.event('assistant', { text: res.text, toolCalls: res.toolCalls });
+    // #320: the provider cut a reply that invented its own tool results. Keep the cut
+    // text: it is the evidence a reader needs to see what the model believed.
+    if (res.notice) await transcript.event('fabricated-results', { notice: res.notice, discarded: res.discarded ?? null });
 
     if (res.text) {
       if (!plan) plan = res.text;
@@ -623,6 +626,9 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
       r.toolResult(call.name, envelope.summary, envelope.ok, envelope.viewHint);
       messages.push({ role: 'tool', toolCallId: call.id, content: result });
     }
+    // After the real results, so the model reads them first and then learns which
+    // of its own "results" to disregard (a tool-less turn got this as its nudge).
+    if (res.notice) messages.push({ role: 'user', content: res.notice });
 
     if (ctx.repairCycles > config.maxRepairCycles) {
       return fail(`repair cycles exhausted (${config.maxRepairCycles}); violations persist`, 'repair-cycles-exhausted');

@@ -115,6 +115,7 @@ export class CursorProvider implements Provider {
       toolCalls: parsed.toolCalls,
       usage: { inputTokens, outputTokens },
       nudge: parsed.nudge,
+      ...(parsed.notice ? { notice: parsed.notice, discarded: parsed.discarded } : {}),
     };
   }
 
