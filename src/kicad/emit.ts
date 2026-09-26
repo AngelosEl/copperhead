@@ -86,6 +86,11 @@ export const LABEL_SIZE = 1.27;
 /** Stroke thickness, mm, of label text and the flag outline drawn with it;
  * KiCad's default is size/8 ≈ 0.16, too faint against a coloured wire. */
 export const LABEL_THICKNESS = 0.2;
+/** Group box outline width, mm: heavier than a wire so the dashes read. */
+export const GROUP_STROKE_WIDTH = 0.3;
+/** Opacity of a coloured group box's tint: enough to band the subsystem,
+ * faint enough that wires and text over it keep full contrast. */
+export const GROUP_FILL_ALPHA = 0.08;
 /** Wire stroke width, mm; 0 would mean KiCad's default of 0.1524. */
 export const WIRE_WIDTH = 0.254;
 
@@ -100,8 +105,9 @@ export interface PlacementModel {
   junctions: { x: number; y: number }[];
   labels: EmitLabel[];
   noConnects: { x: number; y: number }[];
-  rectangles: { x1: number; y1: number; x2: number; y2: number; stroke: 'solid' | 'dash'; name: string }[];
-  captions: { text: string; x: number; y: number; name: string }[];
+  /** Group boxes; a `color` (RGB 0..255) strokes the outline in it over a faint tint of it. */
+  rectangles: { x1: number; y1: number; x2: number; y2: number; stroke: 'solid' | 'dash'; color?: [number, number, number]; name: string }[];
+  captions: { text: string; x: number; y: number; color?: [number, number, number]; name: string }[];
   /** Wire and label colour per net, RGB 0..255; nets absent here draw in the theme default. */
   netColors?: Record<string, [number, number, number]>;
 }
@@ -199,8 +205,9 @@ export function emitSchematic(model: PlacementModel): string {
   const rects = [...model.rectangles].sort((a, b) => a.name.localeCompare(b.name));
   for (const r of rects) {
     L.push(`\t(rectangle (start ${knum(r.x1)} ${knum(r.y1)}) (end ${knum(r.x2)} ${knum(r.y2)})`);
-    L.push(`\t\t(stroke (width 0.152) (type ${r.stroke}))`);
-    L.push('\t\t(fill (type none))');
+    const c = r.color;
+    L.push(`\t\t(stroke (width ${knum(GROUP_STROKE_WIDTH)}) (type ${r.stroke})${c ? ` (color ${c[0]} ${c[1]} ${c[2]} 1)` : ''})`);
+    L.push(c ? `\t\t(fill (type color) (color ${c[0]} ${c[1]} ${c[2]} ${GROUP_FILL_ALPHA}))` : '\t\t(fill (type none))');
     L.push(`\t\t(uuid ${q(id(`rect/${r.name}`))})`);
     L.push('\t)');
   }
@@ -208,7 +215,8 @@ export function emitSchematic(model: PlacementModel): string {
   const caps = [...model.captions].sort((a, b) => a.name.localeCompare(b.name));
   for (const c of caps) {
     L.push(`\t(text ${q(c.text)} (at ${knum(c.x)} ${knum(c.y)} 0)`);
-    L.push(`\t\t(effects (font (size ${knum(CAPTION_SIZE)} ${knum(CAPTION_SIZE)}) bold) (justify left top))`);
+    const color = c.color ? ` (color ${c.color[0]} ${c.color[1]} ${c.color[2]} 1)` : '';
+    L.push(`\t\t(effects (font (size ${knum(CAPTION_SIZE)} ${knum(CAPTION_SIZE)}) bold${color}) (justify left top))`);
     L.push(`\t\t(uuid ${q(id(`caption/${c.name}`))})`);
     L.push('\t)');
   }

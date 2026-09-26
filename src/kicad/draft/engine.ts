@@ -36,6 +36,10 @@ const BOX_PAD = 1;
  * beside, below, and between its caption and the parts: roomier than
  * BOX_PAD, the least a box may hold its text by while it is being fitted. */
 const BOX_INSET = 2;
+/** Grid units of air left of a decoupling cap's body in its bank slot. */
+const BANK_AIR = 1;
+/** Grid units between the end of one bank cap's text and the next slot. */
+const BANK_GAP = 2;
 /** Half the drawn size of a no-connect cross (and a junction dot), mm. */
 const NC_HALF = 0.635;
 /** Grid units between two drawn group boxes, after the boxes have grown to
@@ -133,10 +137,15 @@ const labelBoxAt = (name: string, x: number, y: number, rot: number, kind: EmitL
   // half a height below the line dated from the checker's centred days; kept,
   // it made every name on a row collide with that row's own continuing wire
   // (esp32-amp's UART_TXD could stand nowhere on its 9 mm run).
+  // the text rises off the wire by eeschema's label offset: its ink reaches
+  // LOCAL_LABEL_RISE heights up, as the checker measures it
   return rot === 180
-    ? { minX: x - textW, minY: y - LABEL_HEIGHT, maxX: x, maxY: y }
-    : { minX: x, minY: y - LABEL_HEIGHT, maxX: x + textW, maxY: y };
+    ? { minX: x - textW, minY: y - LOCAL_LABEL_RISE * LABEL_HEIGHT, maxX: x, maxY: y }
+    : { minX: x, minY: y - LOCAL_LABEL_RISE * LABEL_HEIGHT, maxX: x + textW, maxY: y };
 };
+/** How far above its wire a plain label's text reaches, in text heights
+ * (ink measured at 0.46 to 1.93 mm over the line for a 1.27 mm label). */
+const LOCAL_LABEL_RISE = 1.54;
 /** KiCad's label rotation for text running outward along a stub direction. */
 const rotOutward = (o: { dx: number; dy: number }): number => (o.dx === -1 ? 180 : o.dy === -1 ? 90 : o.dy === 1 ? 270 : 0);
 /**
@@ -189,6 +198,8 @@ const LABEL_OVERLAP_BUDGET = 0.02;
 
 const ceilU = (mm: number): number => Math.ceil(mm / U - 1e-9);
 const grid = (units: number): number => Math.round(units) * U;
+/** A coordinate already on the grid, stated without float noise. */
+const onGridLine = (mm: number): number => Number(grid(mm / U).toFixed(6));
 
 /**
  * Two coordinates are the same POINT iff they emit identically: comparisons and
@@ -485,8 +496,10 @@ interface Placed {
   /** Placement rotation, degrees CCW in symbol space (KiCad's `(at x y rot)`); `sym` is already rotated. */
   rot: number;
   /** KiCad `(mirror y)`: the symbol flipped left-for-right before rotation (a
-   * transistor whose base must face the pin that drives it); `sym` is already mirrored. */
-  mirror?: 'y';
+   * transistor whose base must face the pin that drives it); `(mirror x)`:
+   * flipped top-to-bottom (a connector turned over to avoid a crossing).
+   * `sym` is already mirrored. */
+  mirror?: 'x' | 'y';
 }
 
 /** `sym` mirrored left-for-right (KiCad's `(mirror y)`), then turned by `rot`. */
@@ -536,7 +549,24 @@ interface Instance {
   unit: number | null;
   part: IntentPart;
   sym: ResolvedSymbol;
+  /** Drawn mirrored, KiCad's `(mirror x)` (top-to-bottom) or `(mirror y)`
+   * (left-for-right); `sym` is already mirrored. */
+  flip?: 'x' | 'y';
+  /** Drawn turned (a two-lead part lying horizontal, or end for end);
+   * `sym` is already turned, and every placement adds it to the drawn
+   * rotation. */
+  turn?: 90 | 180 | 270;
 }
+
+/** `sym` mirrored as KiCad's `(mirror x)` (top-to-bottom: pin 1 of a header
+ * ends up at the bottom) or `(mirror y)` (left-for-right: its pins face the
+ * other way). */
+const flipped = (sym: ResolvedSymbol, axis: 'x' | 'y'): ResolvedSymbol => {
+  const pins = sym.pins.map((p) => (axis === 'x' ? { ...p, y: -p.y, angle: (360 - p.angle) % 360 } : { ...p, x: -p.x, angle: (540 - p.angle) % 360 }));
+  const b = sym.body ? bodyBoundsOf(sym) : null;
+  const body = b ? (axis === 'x' ? { minX: b.minX, maxX: b.maxX, minY: -b.maxY, maxY: -b.minY } : { minX: -b.maxX, maxX: -b.minX, minY: b.minY, maxY: b.maxY }) : null;
+  return { ...sym, pins, body };
+};
 
 const bodyBoundsOf = (sym: ResolvedSymbol): Bounds => {
   if (sym.body) return sym.body;
@@ -565,6 +595,36 @@ const FAMILY_PALETTE: [number, number, number][] = [
   [140, 80, 40],
   [40, 60, 140],
 ];
+/**
+ * Group box colours, so a subsystem reads as one block at a glance: power
+ * blocks warm, connector and mechanical blocks neutral grey, and every other
+ * block the next colour of a fixed cycle in sheet order (so neighbours differ
+ * and the same design colours the same way every time). The box draws dashed
+ * in this colour over a faint tint of it; the caption takes it too.
+ */
+const GROUP_POWER_COLOR: [number, number, number] = [220, 110, 20];
+const GROUP_NEUTRAL_COLOR: [number, number, number] = [72, 72, 72];
+const GROUP_PALETTE: [number, number, number][] = [
+  [20, 130, 60],
+  [60, 60, 170],
+  [0, 120, 130],
+  [140, 50, 160],
+  [170, 40, 90],
+  [110, 120, 0],
+];
+const POWER_GROUP = /\b(power|ldo|regulators?|regulation|reg|buck|boost|supply|psu|battery|charger|charging|vin|vbus)\b|\d(\.\d+)?\s*v\b/i;
+const NEUTRAL_GROUP = /\b(connector|connectors|header|headers|mounting|mechanical|stemma|qwiic|jack|io|i\/o|usb|debug|swd|jtag|test\s*points?)\b/i;
+function groupColorsOf(groups: string[]): Record<string, [number, number, number]> {
+  const out: Record<string, [number, number, number]> = {};
+  let next = 0;
+  for (const g of groups) {
+    if (POWER_GROUP.test(g)) out[g] = GROUP_POWER_COLOR;
+    else if (NEUTRAL_GROUP.test(g)) out[g] = GROUP_NEUTRAL_COLOR;
+    else out[g] = GROUP_PALETTE[next++ % GROUP_PALETTE.length]!;
+  }
+  return out;
+}
+
 const RAIL_COLOR: [number, number, number] = [170, 30, 30];
 const GROUND_COLOR: [number, number, number] = [70, 70, 70];
 function netColorsOf(nets: IntentNet[], classes: Map<string, { cls: NetClass }>): Record<string, [number, number, number]> {
@@ -752,6 +812,261 @@ const segCrossesBody = (x1: number, y1: number, x2: number, y2: number, b: Bound
  * deterministic. Three rounds bound the cost.
  */
 export function draftSchematicPlacement(validated: ValidatedIntent, projectName: string, today: string): { model: PlacementModel; report: SchematicDraftReport } {
+  // A connector's pin order and the side its pins face are the drafter's
+  // choice, not the part's: a jack whose pins face away from the parts on
+  // its nets sends every wire around it (the preamp's input coupling cap on
+  // one side of J1, its bias and series resistors on the other), and a
+  // riser from a lower pin cuts the upper pin's power stub (npn-switch's SW
+  // past J2's 5V). Each connector is tried turned over (top to bottom) and
+  // mirrored (left for right), one at a time, and a variant is kept when it
+  // leaves fewer wire crossings, or as many and less wire, on the same or a
+  // smaller sheet with every gate holding and the connector still upright.
+  const flips = new Map<string, Orient>();
+  const fitted = draftFitted(validated, projectName, today, flips);
+  const score = (m: PlacementModel): { overlaps: number; crossings: number; length: number } => ({
+    overlaps: labelOverlaps(m),
+    crossings: wireCrossings(m).length,
+    // a label costs as much as an inch of wire: measured on wire alone,
+    // a net drawn as labels cost nothing, and the search traded wired runs
+    // for labels (the preamp's R2 ended up alone under two flags)
+    length: m.wires.reduce((a, w) => a + Math.abs(w.x2 - w.x1) + Math.abs(w.y2 - w.y1), 0) + LABEL_COST * m.labels.length + BEND_COST * wireBends(m),
+  });
+  // no label on another label or on a foreign wire first, then the fewest
+  // crossings, then the least wire
+  const better = (a: ReturnType<typeof score>, b: ReturnType<typeof score>): boolean =>
+    a.overlaps < b.overlaps || (a.overlaps === b.overlaps && (a.crossings < b.crossings || (a.crossings === b.crossings && a.length < b.length - U / 2)));
+  const paperIdx = (m: { report: SchematicDraftReport }): number => PAPERS.findIndex((q) => q.name === m.report.paper);
+  const refusals = (m: { report: SchematicDraftReport }): number => m.report.notes.filter((n) => /refused/.test(n)).length;
+  // A two-lead part (resistor, capacitor, diode, LED, inductor) is also
+  // tried in its other three orientations: lying horizontal (a resistor
+  // standing between two nodes on one row sent its lower lead's wire around
+  // itself) and end for end (a collector's load resistor with its rail end
+  // toward the transistor sent the collector's wire over it and back).
+  const twoLead = (ref: string): boolean => {
+    const sym = validated.symbols.get(ref);
+    return !!sym && !sym.multiUnit && sym.pins.length === 2 && !sym.isPower;
+  };
+  // Only a part with work to do is tried: one with a pin whose wire bends
+  // before it gets anywhere, or that is named by a label where a wire might
+  // reach. A part wired straight on every pin is already where it belongs.
+  const unsettled = unsettledParts(fitted.model, validated);
+  // A crystal and the load caps on its pins belong to the flanking idiom,
+  // which mirrors the caps about the crystal: turning either one broke the
+  // symmetry (C2 turned 270° beside a C1 still hanging below its pin)
+  const isCrystal = (ref: string): boolean => /crystal|reson/i.test(validated.intent.parts.find((p) => p.ref === ref)?.libId ?? '');
+  for (const net of validated.intent.nets) {
+    const refs = net.pins.map((ep) => String(ep).split('.')[0]!);
+    if (refs.some(isCrystal)) for (const ref of refs) unsettled.delete(ref);
+  }
+  const trials: [string, Orient][] = [
+    ...validated.intent.parts.filter((p) => unsettled.has(p.ref) && p.libId.startsWith('Connector') && !validated.symbols.get(p.ref)?.multiUnit).flatMap((p) => [[p.ref, 'x'], [p.ref, 'y']] as [string, Orient][]),
+    ...validated.intent.parts.filter((p) => unsettled.has(p.ref) && twoLead(p.ref)).flatMap((p) => [[p.ref, 90], [p.ref, 180], [p.ref, 270]] as [string, Orient][]),
+  ];
+  trace(`placement search: ${unsettled.size} of ${validated.intent.parts.length} parts unsettled, ${trials.length} trials`);
+  if (!trials.length) return fitted;
+  // Trials are ranked on one draft pass each, the fitting rounds (re-tiling,
+  // the measured look) left out: they settle the page, not the parts, and
+  // multiply every trial's cost. The kept orientations are then drafted in
+  // full once.
+  const labelled = new Set<string>();
+  const once = (f: ReadonlyMap<string, Orient>, lab: ReadonlySet<string> = labelled): { model: PlacementModel; report: SchematicDraftReport } =>
+    draftOnce(validated, projectName, today, new Map(), 0, undefined, 0, undefined, f, lab);
+  let kept = once(flips);
+  let best = score(kept.model);
+  const notes: string[] = [];
+  for (const [ref, axis] of trials) {
+    const trial = new Map([...flips, [ref, axis]]);
+    const t = once(trial);
+    const sc = score(t.model);
+    // a connector keeps its rotation; a turned part never stands with its
+    // ground end up or its supply end down (a decoupling cap turned end for
+    // end drew GND above it and VCC below)
+    const upright = typeof axis === 'number' ? !upsideDown(t, ref, validated) : t.model.symbols.every((sym) => sym.ref !== ref || sym.at.rot === 0);
+    const holds = t.report.mergedNets.length === 0 && !t.report.labelOverlapBudgetExceeded;
+    if (upright && holds && better(sc, best) && paperIdx(t) <= paperIdx(kept) && refusals(t) <= refusals(kept)) {
+      const what = typeof axis === 'number' ? `turned ${axis}°` : axis === 'x' ? 'mirrored top to bottom' : 'mirrored left for right';
+      trace(`${ref} ${what}: overlaps ${best.overlaps} to ${sc.overlaps}, crossings ${best.crossings} to ${sc.crossings}, cost ${best.length.toFixed(1)} to ${sc.length.toFixed(1)} mm`);
+      notes.push(`${ref} ${what}`);
+      flips.set(ref, axis);
+      kept = t;
+      best = sc;
+    }
+  }
+  // A crossing the orientations could not remove: each net through it is
+  // tried drawn as labels between its column-placed parts instead (a part
+  // hung on a pin keeps its wire), and kept when the crossings drop.
+  for (let round = 0; round < 8 && best.crossings > 0; round++) {
+    const at = wireCrossings(kept.model);
+    const nets = [...new Set(at.flatMap((c) => kept.model.wires.filter((w) => (Math.abs(w.x1 - w.x2) < 1e-6 ? Math.abs(w.x1 - c.x) < 1e-6 && Math.min(w.y1, w.y2) < c.y && c.y < Math.max(w.y1, w.y2) : Math.abs(w.y1 - c.y) < 1e-6 && Math.min(w.x1, w.x2) < c.x && c.x < Math.max(w.x1, w.x2))).map((w) => w.net)))].filter((n) => !labelled.has(n)).sort();
+    let improved = false;
+    for (const net of nets) {
+      const lab = new Set([...labelled, net]);
+      const t = once(flips, lab);
+      const sc = score(t.model);
+      if (t.report.mergedNets.length === 0 && !t.report.labelOverlapBudgetExceeded && better(sc, best) && paperIdx(t) <= paperIdx(kept)) {
+        trace(`${net} labelled between column parts: crossings ${best.crossings} to ${sc.crossings}`);
+        notes.push(`${net} labelled`);
+        labelled.add(net);
+        kept = t;
+        best = sc;
+        improved = true;
+        break;
+      }
+    }
+    if (!improved) break;
+  }
+  if (!flips.size && !labelled.size) return fitted;
+  const final = draftFitted(validated, projectName, today, flips, labelled);
+  // the full fit keeps the page the unturned draft had, or a smaller one,
+  // and its gates; otherwise the unturned draft stands
+  const fb = score(fitted.model);
+  const fs = score(final.model);
+  // gates judged against the unturned draft: a sheet already carrying a
+  // box past the frame is not held to a cleaner sheet than it is
+  const gates = (d: { report: SchematicDraftReport }): number =>
+    (d.report.mergedNets.length ? 4 : 0) + (d.report.labelOverlapBudgetExceeded ? 2 : 0) + (d.report.notes.some((n) => /still wrong/.test(n)) ? 1 : 0);
+  if (gates(final) > gates(fitted) || paperIdx(final) > paperIdx(fitted) || !better(fs, fb)) {
+    trace(`placement search: the full fit of ${flips.size} orientation(s) is no better (${fs.overlaps}/${fs.crossings}/${fs.length.toFixed(0)} against ${fb.overlaps}/${fb.crossings}/${fb.length.toFixed(0)}); kept as drafted`);
+    return fitted;
+  }
+  final.report.notes.push(`placement search: ${notes.join(', ')}; label overlaps ${fb.overlaps} to ${fs.overlaps}, wire crossings ${fb.crossings} to ${fs.crossings}`);
+  return final;
+}
+
+/** A part's drawn orientation beyond the placement rules: mirrored (a
+ * connector) or turned (a two-lead part). */
+type Orient = 'x' | 'y' | 90 | 180 | 270;
+
+/** What a label is worth in the placement search, mm of wire. */
+const LABEL_COST = 25.4;
+/** What a bend is worth in the placement search, mm of wire: a turn has to
+ * buy back two units of wire to be worth drawing. */
+const BEND_COST = 2 * U;
+
+/** Parts with a pin that ends in a label, or whose wire turns within its
+ * first run: the only ones the placement search tries in other orientations. */
+function unsettledParts(model: PlacementModel, validated: ValidatedIntent): Set<string> {
+  const key = (x: number, y: number): string => `${x.toFixed(3)},${y.toFixed(3)}`;
+  const byPoint = new Map<string, (typeof model.wires)[number][]>();
+  for (const w of model.wires) for (const [x, y] of [[w.x1, w.y1], [w.x2, w.y2]] as const) byPoint.set(key(x, y), [...(byPoint.get(key(x, y)) ?? []), w]);
+  // a label counts only on a net that stays in one group: a net leaving the
+  // group is labelled wherever its part points
+  const groupOfRef = new Map(validated.intent.parts.map((p) => [p.ref, p.group]));
+  const localNets = new Set(
+    validated.intent.nets
+      .filter((n) => new Set(n.pins.map((ep) => groupOfRef.get(String(ep).split('.')[0]!))).size === 1)
+      .map((n) => n.name),
+  );
+  const labelled = new Set(model.labels.filter((l) => localNets.has(l.name)).map((l) => key(l.x, l.y)));
+  /** Follow the wire from a pin: does it end in a label, or turn, before a junction or another pin? */
+  const unsettledFrom = (x: number, y: number): boolean => {
+    let at = key(x, y);
+    let prev: (typeof model.wires)[number] | undefined;
+    for (let steps = 0; steps < 8; steps++) {
+      const next = (byPoint.get(at) ?? []).filter((w) => w !== prev);
+      if (next.length !== 1) return false; // nothing drawn, or a junction: settled here
+      const w = next[0]!;
+      if (prev && Math.abs(prev.y1 - prev.y2) < 1e-6 !== Math.abs(w.y1 - w.y2) < 1e-6) return true; // a turn
+      const far = key(w.x1, w.y1) === at ? key(w.x2, w.y2) : key(w.x1, w.y1);
+      if (labelled.has(far)) return true;
+      prev = w;
+      at = far;
+    }
+    return false;
+  };
+  const out = new Set<string>();
+  for (const sym of model.symbols) {
+    const src = validated.symbols.get(sym.ref);
+    if (!src || src.isPower) continue;
+    const pins = (sym.unit && src.units?.find((u) => u.unit === sym.unit)?.pins) || src.pins;
+    for (const pin of pins) {
+      let px = pin.x;
+      let py = pin.y;
+      if (sym.mirror === 'y') px = -px;
+      if (sym.mirror === 'x') py = -py;
+      const r = ((sym.at.rot % 360) + 360) % 360;
+      const [rx, ry] = r === 90 ? [-py, px] : r === 180 ? [-px, -py] : r === 270 ? [py, -px] : [px, py];
+      if (unsettledFrom(sym.at.x + rx, sym.at.y - ry)) {
+        out.add(sym.ref);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** Whether `ref` is drawn standing with a ground pin above its other pin, or
+ * a supply pin below it. */
+function upsideDown(draft: { model: PlacementModel; report: SchematicDraftReport }, ref: string, validated: ValidatedIntent): boolean {
+  const sym = draft.model.symbols.find((q) => q.ref === ref);
+  const src = validated.symbols.get(ref);
+  if (!sym || !src || src.pins.length !== 2) return false;
+  const cls = new Map(draft.report.netClasses.map((n) => [n.name, n.class]));
+  const netOf = (num: string): string | undefined => validated.intent.nets.find((n) => n.pins.includes(`${ref}.${num}`))?.name;
+  const r = ((sym.at.rot % 360) + 360) % 360;
+  // drawn height of each pin, schematic y down: smaller is higher
+  const ys = src.pins.map((pin) => {
+    let px = pin.x;
+    let py = pin.y;
+    if (sym.mirror === 'y') px = -px;
+    if (sym.mirror === 'x') py = -py;
+    const ry = r === 90 ? px : r === 180 ? -py : r === 270 ? -px : py;
+    return { y: sym.at.y - ry, cls: cls.get(netOf(pin.number) ?? '') };
+  });
+  const [a, b] = ys as [(typeof ys)[number], (typeof ys)[number]];
+  if (Math.abs(a.y - b.y) < 1e-6) return false; // lying horizontal
+  const [top, bottom] = a.y < b.y ? [a, b] : [b, a];
+  return top.cls === 'ground' || bottom.cls === 'rail';
+}
+
+/** Corners: points where exactly two wires of one net meet at a right angle. */
+function wireBends(model: PlacementModel): number {
+  const at = new Map<string, { net: string; horiz: boolean }[]>();
+  for (const w of model.wires) {
+    const horiz = Math.abs(w.y1 - w.y2) < 1e-6;
+    for (const [x, y] of [[w.x1, w.y1], [w.x2, w.y2]] as const) {
+      const k = `${w.net}@${x.toFixed(3)},${y.toFixed(3)}`;
+      at.set(k, [...(at.get(k) ?? []), { net: w.net, horiz }]);
+    }
+  }
+  let n = 0;
+  for (const segs of at.values()) if (segs.length === 2 && segs[0]!.horiz !== segs[1]!.horiz) n++;
+  return n;
+}
+
+/** Labels whose text lands on another label or on another net's wire. */
+function labelOverlaps(model: PlacementModel): number {
+  const boxes = model.labels.map((l) => ({ l, b: labelTextBox(l.name, l.x, l.y, l.rot, l.kind) }));
+  let n = 0;
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) if (boundsOverlap(boxes[i]!.b, boxes[j]!.b)) n++;
+    const { l, b } = boxes[i]!;
+    for (const w of model.wires) if (w.net !== l.name && segCrossesBody(w.x1, w.y1, w.x2, w.y2, b)) n++;
+  }
+  return n;
+}
+
+/** Points where two wires cross without joining: a horizontal and a
+ * vertical wire meeting strictly inside both, with no junction there. */
+function wireCrossings(model: PlacementModel): { x: number; y: number }[] {
+  const eps = 1e-6;
+  const hs = model.wires.filter((w) => Math.abs(w.y1 - w.y2) < eps && Math.abs(w.x1 - w.x2) > eps);
+  const vs = model.wires.filter((w) => Math.abs(w.x1 - w.x2) < eps && Math.abs(w.y1 - w.y2) > eps);
+  const out: { x: number; y: number }[] = [];
+  for (const h of hs) {
+    for (const v of vs) {
+      const x = v.x1;
+      const y = h.y1;
+      if (x <= Math.min(h.x1, h.x2) + eps || x >= Math.max(h.x1, h.x2) - eps) continue;
+      if (y <= Math.min(v.y1, v.y2) + eps || y >= Math.max(v.y1, v.y2) - eps) continue;
+      if (model.junctions.some((j) => Math.abs(j.x - x) < eps && Math.abs(j.y - y) < eps)) continue;
+      out.push({ x, y });
+    }
+  }
+  return out;
+}
+
+function draftFitted(validated: ValidatedIntent, projectName: string, today: string, flips: ReadonlyMap<string, Orient>, labelled: ReadonlySet<string> = new Set()): { model: PlacementModel; report: SchematicDraftReport } {
   const reserves = new Map<string, { left: number; right: number }>();
   let frameSlack = 0;
   let wrapGap = 0;
@@ -782,7 +1097,7 @@ export function draftSchematicPlacement(validated: ValidatedIntent, projectName:
   let look: 'not-yet' | 'drafting' | 'done' = 'not-yet';
   let lookVerdict: { kept: boolean; paperBefore: string; paperAfter: string } | undefined;
   for (let round = 0; round < 16; round++) {
-    const { model, report, rects, measured: nextMeasured, reach, wrapped } = draftOnce(validated, projectName, today, reserves, frameSlack, measured, wrapGap, reachMeasured);
+    const { model, report, rects, measured: nextMeasured, reach, wrapped } = draftOnce(validated, projectName, today, reserves, frameSlack, measured, wrapGap, reachMeasured, flips, labelled);
     let widened = false;
     const stillWrong: string[] = [];
     // A row or column wrapped to the full usable width leaves no room for the
@@ -906,6 +1221,8 @@ function draftOnce(
   measured?: Map<string, Overhang>,
   wrapGap = 0,
   reachMeasured?: Map<string, Reach>,
+  flips: ReadonlyMap<string, Orient> = new Map(),
+  labelNets: ReadonlySet<string> = new Set(),
 ): {
   model: PlacementModel;
   report: SchematicDraftReport;
@@ -941,7 +1258,11 @@ function draftOnce(
   const instances: Instance[] = intent.parts.flatMap((p): Instance[] => {
     const sym = symbols.get(p.ref);
     if (!sym) return [];
-    if (!sym.multiUnit || !sym.units?.length) return [{ key: p.ref, ref: p.ref, unit: null, part: p, sym }];
+    if (!sym.multiUnit || !sym.units?.length) {
+      const axis = flips.get(p.ref);
+      if (axis === 90 || axis === 180 || axis === 270) return [{ key: p.ref, ref: p.ref, unit: null, part: p, sym: rotatedSym(sym, axis), turn: axis }];
+      return [axis ? { key: p.ref, ref: p.ref, unit: null, part: p, sym: flipped(sym, axis), flip: axis } : { key: p.ref, ref: p.ref, unit: null, part: p, sym }];
+    }
     const common = new Set(sym.commonUnitPins ?? []);
     for (const n of common) commonEps.add(`${p.ref}.${n}`);
     const referenced = sym.units.filter((u) =>
@@ -1548,9 +1869,61 @@ function draftOnce(
       // rises from the jack's pin, a button's pull-up, debounce cap and ESD
       // diode hang on the switch's signal pin. A switch already hung on an
       // IC pin (a reset button dropping from EN) anchors nothing itself.
+      // A transistor comes last: its only side pin is its base or gate, and
+      // a base pull-down drawn in a column past the transistor sent the base
+      // net across the collector's (npn-switch's R2 against SW); hung from
+      // the base row it drops on the base's own side. A transistor already
+      // on a row or hung anchors nothing itself.
+      // Feedback bridges: a two-lead part between an amplifier's input and
+      // that unit's own output (a gain or hysteresis resistor, a
+      // compensation cap) lies across the amplifier, over the top from the
+      // upper input and under the bottom from the lower one, the way a
+      // drafter draws feedback. Laid along the input's row instead, its
+      // output end had to be wired back under the amplifier, through
+      // whatever hung from the other input (a comparator's 1M hysteresis
+      // resistor crossed its own divider twice).
+      type Bridge = { ic: string; key: string; inPin: DraftPin; outPin: DraftPin; inLead: string; side: -1 | 1; level: number };
+      const bridges: Bridge[] = [];
+      const BRIDGE_ROWS = 6;
+      for (const icKey of anchors) {
+        const ic = instByKey.get(icKey)!;
+        const outs = ic.sym.pins.filter((p) => p.etype === 'output' || p.etype === 'open_collector');
+        const ins = ic.sym.pins.filter((p) => /^[+-]$/.test(p.name) && outward(p).dx !== 0);
+        for (const outPin of outs) {
+          const outNet = netByEndpoint.get(`${ic.ref}.${outPin.number}`);
+          if (!outNet || outward(outPin).dx === 0) continue;
+          for (const inPin of ins) {
+            if (outward(inPin).dx !== -outward(outPin).dx) continue;
+            const inNet = netByEndpoint.get(`${ic.ref}.${inPin.number}`);
+            if (!inNet || inNet === outNet) continue;
+            const side: -1 | 1 = inPin.y >= outPin.y ? -1 : 1;
+            for (const ep of inNet.pins) {
+              const e = epKey(ep);
+              if (!e || !hangable(e.key) || isTestPoint(e.key)) continue;
+              const l = leadsOf(e.key)!;
+              const other = l.a.number === e.pin ? l.b : l.a;
+              if (netByEndpoint.get(`${instByKey.get(e.key)!.ref}.${other.number}`) !== outNet) continue;
+              const level = bridges.filter((b) => b.ic === icKey && b.side === side).length;
+              bridges.push({ ic: icKey, key: e.key, inPin, outPin, inLead: e.pin, side, level });
+              hungKeys.add(e.key);
+              boundTo.set(e.key, icKey);
+              trace(`${ic.ref}.${inPin.number} ${inNet.name}: ${instByKey.get(e.key)!.ref} bridges to ${ic.ref}.${outPin.number} ${side < 0 ? 'over' : 'under'} the amplifier`);
+            }
+          }
+        }
+      }
+      // the amplifier's cell makes room for its bridges above and below
+      for (const icKey of new Set(bridges.map((b) => b.ic))) {
+        const d = cellDims.get(icKey);
+        if (!d) continue;
+        const up = bridges.filter((b) => b.ic === icKey && b.side < 0).length;
+        const down = bridges.filter((b) => b.ic === icKey && b.side > 0).length;
+        cellDims.set(icKey, { ...d, topPad: d.topPad + up * BRIDGE_ROWS, h: d.h + (up + down) * BRIDGE_ROWS });
+      }
       const claimAnchors = [
         ...anchors,
         ...members.filter((m) => !anchors.includes(m.key) && (isConnector(m.part) || isSwitch(m.key))).map((m) => m.key),
+        ...members.filter((m) => !anchors.includes(m.key) && isTransistor(m.key)).map((m) => m.key),
       ];
       for (const icKey of claimAnchors) {
         if (hungKeys.has(icKey)) continue;
@@ -1658,6 +2031,14 @@ function draftOnce(
             } else if (farCls === 'rail') {
               trace(`${ic.ref}.${pin.number} ${net.name}: ${instByKey.get(first.key)!.ref} rises (to ${farNet!.name})`);
               claimHang(icKey, pin, dx, first, -1);
+            } else if (inlines.some((il) => il.ic === icKey && il.pin.number === pin.number)) {
+              // A row carries one series run: a second one laid past the first
+              // ends at the first's far net, not the pin's, and has to be wired
+              // back around it (an op-amp's feedback and gain resistors both on
+              // its inverting input drew FB2 under R13 and flagged the pin over
+              // its wire). It drops from the pin in a lane of its own instead.
+              trace(`${ic.ref}.${pin.number} ${net.name}: ${instByKey.get(first.key)!.ref} hangs down (the row already carries a series part; far net ${farNet?.name ?? 'none'})`);
+              claimHang(icKey, pin, dx, first, 1);
             } else {
               trace(`${ic.ref}.${pin.number} ${net.name}: ${instByKey.get(first.key)!.ref} lies on the row (far net ${farNet?.name ?? 'none'})`);
               claimInline(icKey, pin, dx, first);
@@ -1774,7 +2155,14 @@ function draftOnce(
             // the same five units (four of pad plus one) the clearance check
             // itself applies, else a neighbour exactly at the edge passes here
             // and refuses there (J1's fuse against the CC1 pin two rows down)
-            const straight = !sidePinYs.some((y) => y !== rowY && y > top - 5 * U && y < bot + 5 * U);
+            // An op-amp output fed back to its own inverting input keeps its
+            // stub for the feedback loop, which drops from it past the
+            // amplifier: a part hung dead straight there (a follower's
+            // output cap) sat where the loop has to go, and the loop went
+            // over the top through the other input's stub instead.
+            const pinNet = netByEndpoint.get(`${ic.ref}.${g[0]!.pin.number}`);
+            const feedsBack = g[0]!.pin.etype === 'output' && ic.sym.pins.some((p) => /^(-|IN-|−)$/i.test(p.name) && !!pinNet?.pins.includes(`${ic.ref}.${p.number}`));
+            const straight = !feedsBack && !sidePinYs.some((y) => y !== rowY && y > top - 5 * U && y < bot + 5 * U);
             for (const hg of g) hg.straight = straight;
             if (straight) continue;
             anyShelved = true;
@@ -2133,6 +2521,9 @@ function draftOnce(
           bandCount++;
         }
         let rowY = bandTop;
+        // the stubs the part above draws below itself: how far down they
+        // reach (mm) and which nets they carry
+        let above: { y: number; nets: Set<string> } | null = null;
         for (const ref of col) {
           const dims = cellDims.get(ref)!;
           // shared column axis (units): the core span between the shelves a
@@ -2142,11 +2533,35 @@ function draftOnce(
           // the body sits at the top of its cell, under the room any up-hang
           // needs; a cell with nothing hung is body plus margins, so this is
           // its centre as before
-          const cy = rowY + dims.topPad + VMARGIN + Math.floor(ceilU(b.maxY - b.minY) / 2);
+          let cy = rowY + dims.topPad + VMARGIN + Math.floor(ceilU(b.maxY - b.minY) / 2);
+          const inst = instByKey.get(ref)!;
+          const netAt = (pin: DraftPin): string | undefined => netByEndpoint.get(`${inst.ref}.${pin.number}`)?.name;
+          // A pin facing up draws a stub toward the part above, whose pin
+          // facing down draws one toward this part. On two different nets the
+          // two stubs need a unit of air between them, or one net's label
+          // lands on the other's wire and KiCad joins them (a Sallen-Key's
+          // two caps stacked in one column put FILT's flag on SK2's stub).
+          // Rows are only ever pushed down for it, a whole unit at a time.
+          // Either stub may end in a flag reading along it, as long as its
+          // name plus the flag's tip (two stacked transistors put C2N's flag
+          // on Q1's emitter): the room is reserved for it.
+          const flagReach = (net: string): number => Math.max(1, net.length) * LABEL_ADVANCE * LABEL_HEIGHT + FLAG_PAD;
+          const upPins = inst.sym.pins.filter((p) => outward(p).dy === -1 && netAt(p) !== undefined);
+          if (above && upPins.some((p) => !above!.nets.has(netAt(p)!))) {
+            const oy0 = grid(cy + Math.round((b.minY + b.maxY) / 2 / U));
+            const stubTop = Math.min(...upPins.map((p) => oy0 - p.y - flagReach(netAt(p)!))) - STUB * U;
+            const short = above.y + U - stubTop;
+            if (short > 1e-6) {
+              const k = Math.ceil(short / U - 1e-6);
+              cy += k;
+              rowY += k;
+            }
+          }
           // origin so the body centers on the cell center, snapped to grid
           const ox = grid(cx - Math.round((b.minX + b.maxX) / 2 / U));
           const oy = grid(cy + Math.round((b.minY + b.maxY) / 2 / U));
-          const inst = instByKey.get(ref)!;
+          const downPins = inst.sym.pins.filter((p) => outward(p).dy === 1 && netAt(p) !== undefined);
+          above = downPins.length ? { y: Math.max(...downPins.map((p) => oy - p.y + flagReach(netAt(p)!))) + STUB * U, nets: new Set(downPins.map((p) => netAt(p)!)) } : null;
           placed.set(ref, {
             part: inst.part,
             refDes: inst.ref,
@@ -2157,7 +2572,8 @@ function draftOnce(
             body: { minX: ox + b.minX, minY: oy - b.maxY, maxX: ox + b.maxX, maxY: oy - b.minY },
             cellW: dims.w,
             cellH: dims.h,
-            rot: 0,
+            rot: inst.turn ?? 0,
+            ...(inst.flip ? { mirror: inst.flip } : {}),
           });
           if (infill.has(ref)) hostGeom.set(ref, { colX, colW, colShelfR, rowY });
           rowY += dims.h + ROW_GAP;
@@ -2237,8 +2653,12 @@ function draftOnce(
           // a measured cap takes the room its drawing needed (its own fields,
           // the rail bar and name above, the ground below), plus the pad
           const mo = measured?.get(ref);
-          const capW = mo ? ceilU(mo.left) + ceilU(b.maxX - b.minX) + ceilU(mo.right) + 2 * MEASURE_PAD : ceilU(b.maxX - b.minX) + 2 * MARGIN;
-          const capLeft = mo ? ceilU(mo.left) + MEASURE_PAD : MARGIN;
+          // a cap's reference and value stand beside its body, and the next
+          // cap starts a fixed gap past that text: measured by body alone,
+          // "100u/25V" ran into the next part and the gaps read uneven
+          const capText = Math.max(inst.ref.length, inst.part.value.length) * TEXT_RESERVE * LABEL_HEIGHT + U;
+          const capW = mo ? ceilU(mo.left) + ceilU(b.maxX - b.minX) + ceilU(mo.right) + 2 * MEASURE_PAD : BANK_AIR + ceilU(b.maxX - b.minX) + ceilU(capText) + BANK_GAP;
+          const capLeft = mo ? ceilU(mo.left) + MEASURE_PAD : BANK_AIR;
           const capTop = mo ? ceilU(mo.top) + MEASURE_PAD : MARGIN;
           const capRowH = mo ? capTop + ceilU(b.maxY - b.minY) + ceilU(mo.bottom) + MEASURE_PAD : 2 * MARGIN + 6;
           bankRowH = Math.max(bankRowH, capRowH);
@@ -2274,7 +2694,7 @@ function draftOnce(
             body: { minX: ox + b.minX, minY: oy - b.maxY, maxX: ox + b.maxX, maxY: oy - b.minY },
             cellW: capW,
             cellH: capRowH,
-            rot,
+            rot: (rot + (inst.turn ?? 0)) % 360,
           });
           capX += capW;
         }
@@ -2332,6 +2752,7 @@ function draftOnce(
           cellW: prev.cellW,
           cellH: prev.cellH,
           rot: prev.rot,
+          ...(prev.mirror ? { mirror: prev.mirror } : {}),
         };
       };
       /** Apply candidate moves unless any moved body lands within a grid unit of
@@ -2520,10 +2941,13 @@ function draftOnce(
           }
         }
       };
-      const placeCell = (key: string, ox: number, oy: number, rot = 0, mirror?: 'y'): Placed => {
+      const placeCell = (key: string, ox: number, oy: number, rot = 0, mirrored?: 'x' | 'y'): Placed => {
         const inst = instByKey.get(key)!;
         const dims = cellDims.get(key)!;
-        const sym = transformSym(inst.sym, rot, mirror);
+        // a flipped instance's symbol is flipped already; only a left-for-right
+        // mirror is applied here, and a flip is carried to the drawn symbol
+        const sym = transformSym(inst.sym, rot, mirrored === 'y' ? 'y' : undefined);
+        const mirror = mirrored === 'y' && !inst.flip ? 'y' : inst.flip;
         const b = bodyBoundsOf(sym);
         return {
           part: inst.part,
@@ -2535,7 +2959,7 @@ function draftOnce(
           body: { minX: ox + b.minX, minY: oy - b.maxY, maxX: ox + b.maxX, maxY: oy - b.minY },
           cellW: dims.w,
           cellH: dims.h,
-          rot,
+          rot: (rot + (inst.turn ?? 0)) % 360,
           ...(mirror ? { mirror } : {}),
         };
       };
@@ -2676,6 +3100,42 @@ function draftOnce(
           if (!notes.includes(note)) notes.push(note);
         }
       }
+      // bridges across their amplifier, once it stands where it will
+      for (const br of bridges) {
+        const pl = placed.get(br.ic);
+        if (!pl) {
+          leftovers.push(br.key);
+          continue;
+        }
+        const inAt = pinAt(pl, br.inPin);
+        const outAt = pinAt(pl, br.outPin);
+        const oi = outward(br.inPin);
+        const oo = outward(br.outPin);
+        const inEnd = { x: inAt.x + oi.dx * STUB * U, y: inAt.y };
+        const outEnd = { x: outAt.x + oo.dx * STUB * U, y: outAt.y };
+        const rot = orientFor(br.key, br.inLead, { dx: oi.dx, dy: 0 }) ?? 0;
+        const rs = rotatedSym(instByKey.get(br.key)!.sym, rot);
+        const near = rs.pins.find((p) => p.number === br.inLead)!;
+        const far = rs.pins.find((p) => p.number !== br.inLead)!;
+        const midX = grid(Math.round((inEnd.x + outEnd.x) / 2 / U));
+        let done = false;
+        for (let tier = 0; tier < 4 && !done; tier++) {
+          const edge = br.side < 0 ? Math.min(pl.body.minY, inAt.y, outAt.y) : Math.max(pl.body.maxY, inAt.y, outAt.y);
+          const lineY = grid(Math.round(edge / U) + br.side * (3 + 3 * (br.level + tier)));
+          const cand = placeCell(br.key, grid(Math.round((midX - (near.x + far.x) / 2) / U)), lineY + near.y, rot);
+          if (applyMoves(new Map([[br.key, cand]]))) {
+            trace(`bridge ${instByKey.get(br.key)!.ref} ${br.side < 0 ? 'over' : 'under'} ${instByKey.get(br.ic)!.ref} at y ${lineY.toFixed(2)}`);
+            done = true;
+          }
+        }
+        if (!done) {
+          boundTo.delete(br.key);
+          leftovers.push(br.key);
+          const note = `bridge refused: ${instByKey.get(br.key)!.ref} could not lie across ${instByKey.get(br.ic)!.ref} in "${gname}"; drawn in a column instead`;
+          trace(note);
+          if (!notes.includes(note)) notes.push(note);
+        }
+      }
       if (leftovers.length) {
         // a column of their own past everything the group placed so far
         let x = Math.max(groupX, ...[...placed.values()].filter((p) => groupOf.get([...placed.entries()].find(([, q]) => q === p)?.[0] ?? '') === gname).map((p) => Math.ceil(p.body.maxX / U) + MARGIN)) + CHANNEL;
@@ -2761,7 +3221,7 @@ function draftOnce(
           for (const key of chain) {
             const pl = placed.get(key)!;
             unturned.set(key, pl);
-            placed.set(key, placeCell(key, pl.x, pl.y, (pl.rot + 180) % 360, pl.mirror));
+            placed.set(key, placeCell(key, pl.x, pl.y, (pl.rot - (instByKey.get(key)!.turn ?? 0) + 180 + 360) % 360, pl.mirror));
           }
           [topEnd, bottomEnd] = [bottomEnd, topEnd];
           chain.reverse();
@@ -3459,7 +3919,22 @@ function draftOnce(
   let wireIdx = new Map<string, number>();
   const addWire = (net: string, x1: number, y1: number, x2: number, y2: number): void => {
     if (sameCoord(x1, x2) && sameCoord(y1, y2)) return; // zero-length once emitted
-
+    // A stub two routes of one net both start from is drawn once: already
+    // drawn whole, or in pieces that lie inside it (a feedback loop tapping
+    // it). A longer wire merely running through it does not count: KiCad
+    // joins only at wire ends, and a trunk through a stub's end leaves that
+    // stub unconnected.
+    const horiz = sameCoord(y1, y2);
+    const lo0 = horiz ? Math.min(x1, x2) : Math.min(y1, y2);
+    const hi0 = horiz ? Math.max(x1, x2) : Math.max(y1, y2);
+    const pieces = wires
+      .filter((w) => w.net === net && (horiz ? sameCoord(w.y1, y1) && sameCoord(w.y2, y1) : sameCoord(w.x1, x1) && sameCoord(w.x2, x1)))
+      .map((w) => (horiz ? [Math.min(w.x1, w.x2), Math.max(w.x1, w.x2)] : [Math.min(w.y1, w.y2), Math.max(w.y1, w.y2)]) as [number, number])
+      .filter(([lo, hi]) => lo >= lo0 - 1e-6 && hi <= hi0 + 1e-6)
+      .sort((a, b) => a[0] - b[0]);
+    let reach = lo0;
+    for (const [lo, hi] of pieces) if (lo <= reach + 1e-6) reach = Math.max(reach, hi);
+    if ((horiz || sameCoord(x1, x2)) && pieces.length && reach >= hi0 - 1e-6) return;
     const i = wireIdx.get(net) ?? 0;
     wireIdx.set(net, i + 1);
     wires.push({ x1, y1, x2, y2, net, index: i });
@@ -3857,6 +4332,37 @@ function draftOnce(
 
   // signal nets: local nets wired, everything else labelled at a stub
   const bodies = [...placed.values()].map((p) => p.body);
+  // Every signal pin's stub, drawn or not yet: a route is judged against the
+  // stubs of nets drafted after it as well as the wires of those before. A
+  // stub is taken two units longer than drawn, the room its label needs: a
+  // route passing just past a stub's end left its label no room, and the
+  // label nudge then grew the stub across the route (R7's STAGE1 through
+  // the Sallen-Key's SK1).
+  const pendingStubs = signalNets.flatMap((n) =>
+    endpointsOf(n).map((ep) => {
+      const o = outward(ep.pin);
+      return { net: n.name, x1: ep.at.x, y1: ep.at.y, x2: ep.at.x + o.dx * (STUB + 2) * U, y2: ep.at.y + o.dy * (STUB + 2) * U };
+    }),
+  );
+  /** How many foreign wires or stubs `segs` cross (a horizontal against a
+   * vertical, strictly inside both). */
+  const crossingsOf = (net: string, segs: { x1: number; y1: number; x2: number; y2: number }[]): number => {
+    let n = 0;
+    const others = [...wires.filter((w) => w.net !== net), ...pendingStubs.filter((st) => st.net !== net)];
+    for (const a of segs) {
+      const ah = sameCoord(a.y1, a.y2);
+      for (const b of others) {
+        const bh = sameCoord(b.y1, b.y2);
+        if (ah === bh) continue;
+        const h = ah ? a : b;
+        const v = ah ? b : a;
+        const x = v.x1;
+        const y = h.y1;
+        if (x > Math.min(h.x1, h.x2) + 1e-6 && x < Math.max(h.x1, h.x2) - 1e-6 && y > Math.min(v.y1, v.y2) + 1e-6 && y < Math.max(v.y1, v.y2) - 1e-6) n++;
+      }
+    }
+    return n;
+  };
   let wired = 0;
   let labelled = 0;
   for (const net of [...signalNets].sort((a, b) => a.name.localeCompare(b.name))) {
@@ -3876,7 +4382,7 @@ function draftOnce(
      * gate, and a routed contact would merge nets.
      */
     type RouteSeg = { x1: number; y1: number; x2: number; y2: number };
-    type Route = { segs: RouteSeg[]; trunkX: number; trunkY?: number };
+    type Route = { segs: RouteSeg[]; trunkX: number; trunkY?: number; taps?: { x: number; y: number }[] };
     const routeStubs = (subset: Stub[]): Route | null => {
       const xs = subset.map((s) => s.end.x).sort((a, b) => a - b);
       const ys = subset.map((s) => s.end.y);
@@ -3957,18 +4463,88 @@ function draftOnce(
           if (found.length) break;
         }
       }
+      // A loop, for two sideways stubs facing away from each other: an
+      // op-amp's output tied back to its inverting input, the feedback a
+      // drafter draws around the amplifier. From the first stub the wire
+      // drops (or rises) past everything between them, crosses, and comes
+      // back up (or down) into the other stub, on the side of the second
+      // pin first. Without it the router had no shape for the pair and a
+      // follower's feedback shipped as two labels, or as a wire to wherever
+      // else the net went (TL072 buffers on the analog preamp).
+      if (!found.length && subset.length === 2) {
+        const [a, b] = subset as [Stub, Stub];
+        if (a.o.dy === 0 && b.o.dy === 0 && a.o.dx === -b.o.dx) {
+          const minX = Math.min(a.end.x, b.end.x);
+          const maxX = Math.max(a.end.x, b.end.x);
+          const between = bodies.filter((bd) => bd.maxX > minX && bd.minX < maxX && bd.maxY >= Math.min(a.end.y, b.end.y) - 4 * U && bd.minY <= Math.max(a.end.y, b.end.y) + 4 * U);
+          const lo = Math.max(a.end.y, b.end.y, ...between.map((bd) => bd.maxY));
+          const hi = Math.min(a.end.y, b.end.y, ...between.map((bd) => bd.minY));
+          const sides = b.end.y >= a.end.y ? [1, -1] : [-1, 1];
+          for (const side of sides) {
+            const loopY = side > 0 ? grid(Math.ceil(lo / U - 1e-6) + 2) : grid(Math.floor(hi / U + 1e-6) - 2);
+            const candidate: RouteSeg[] = [
+              { x1: a.ep.at.x, y1: a.ep.at.y, x2: a.end.x, y2: a.end.y },
+              { x1: a.end.x, y1: a.end.y, x2: a.end.x, y2: loopY },
+              { x1: a.end.x, y1: loopY, x2: b.end.x, y2: loopY },
+              { x1: b.end.x, y1: loopY, x2: b.end.x, y2: b.end.y },
+              { x1: b.ep.at.x, y1: b.ep.at.y, x2: b.end.x, y2: b.end.y },
+            ];
+            if (admit(candidate)) {
+              found.push({ segs: candidate, trunkX: a.end.x, trunkY: loopY });
+              break;
+            }
+          }
+          // A stub end already carries a part hung on it (a follower's output
+          // cap), or sits over a neighbouring pin's stub end: the loop taps a
+          // stub a unit out from the pin instead, with a junction there. The
+          // second stub ends at the tap (nothing else is on it). Every
+          // variant that clears is kept, and the pick below prefers the one
+          // crossing the fewest wires: the first to clear went over the top,
+          // through the next pin's stub.
+          for (const [tapA, tapB] of [[true, false], [false, true], [true, true]] as const) {
+            if (found.length && !found.some((r) => r.taps)) break;
+            const xa = tapA ? a.ep.at.x + a.o.dx * U : a.end.x;
+            const xb = tapB ? b.ep.at.x + b.o.dx * U : b.end.x;
+            // measured over the span this variant actually crosses: a tap
+            // inside the part hung on the stub end leaves that part outside
+            const spanned = bodies.filter((bd) => bd.maxX > Math.min(xa, xb) && bd.minX < Math.max(xa, xb) && bd.maxY >= Math.min(a.end.y, b.end.y) - 4 * U && bd.minY <= Math.max(a.end.y, b.end.y) + 4 * U);
+            const tLo = Math.max(a.end.y, b.end.y, ...spanned.map((bd) => bd.maxY));
+            const tHi = Math.min(a.end.y, b.end.y, ...spanned.map((bd) => bd.minY));
+            for (const side of sides) {
+              const loopY = side > 0 ? grid(Math.ceil(tLo / U - 1e-6) + 2) : grid(Math.floor(tHi / U + 1e-6) - 2);
+              const candidate: RouteSeg[] = [
+                ...(tapA ? [{ x1: a.ep.at.x, y1: a.ep.at.y, x2: xa, y2: a.ep.at.y }, { x1: xa, y1: a.ep.at.y, x2: a.end.x, y2: a.end.y }] : [{ x1: a.ep.at.x, y1: a.ep.at.y, x2: a.end.x, y2: a.end.y }]),
+                { x1: xa, y1: a.ep.at.y, x2: xa, y2: loopY },
+                { x1: xa, y1: loopY, x2: xb, y2: loopY },
+                { x1: xb, y1: loopY, x2: xb, y2: b.ep.at.y },
+                ...(tapB ? [{ x1: b.ep.at.x, y1: b.ep.at.y, x2: xb, y2: b.ep.at.y }] : [{ x1: b.ep.at.x, y1: b.ep.at.y, x2: b.end.x, y2: b.end.y }]),
+              ];
+              if (admit(candidate)) {
+                const taps = tapA ? [{ x: xa, y: a.ep.at.y }] : [];
+                found.push({ segs: candidate, trunkX: xa, trunkY: loopY, taps });
+              }
+            }
+          }
+        }
+      }
       if (!found.length) {
         trace(`route ${net.name}: no clean route for ${subset.map((s) => `${s.ep.ref}.${s.ep.pin.number}`).join(', ')}`);
         return null;
       }
-      // the fewest segments is the fewest bends; ties keep the classic order
-      return found.reduce((best, r) => (r.segs.length < best.segs.length ? r : best), found[0]!);
+      // the fewest crossings first (a route across another net's wire reads
+      // as a short: the Sallen-Key's SK1 ran along R7 across its STAGE1
+      // stub), then the fewest segments, which is the fewest bends; ties
+      // keep the classic order
+      const scored = found.map((r) => ({ r, x: crossingsOf(net.name, r.segs) }));
+      return scored.reduce((best, c) => (c.x < best.x || (c.x === best.x && c.r.segs.length < best.r.segs.length) ? c : best), scored[0]!).r;
     };
     /** Labels naming this net's wired runs, promoted to flags below if the net also leaves through a stub. */
     const netWired: number[] = [];
     /** Draw a routed subset: its wires, one label naming the net, and junction dots. */
-    const commitRoute = (subset: Stub[], r: Route): void => {
+    const commitRoute = (subset: Stub[], r: Route, named = true): void => {
       for (const c of r.segs) addWire(net.name, c.x1, c.y1, c.x2, c.y2);
+      for (const t of r.taps ?? []) junctions.push(t);
+      if (!named) return;
       // one label names the wired run (topmost-leftmost wire point): the net
       // stays identifiable to PINOUT/drift and to a reviewer without a
       // label-per-pin, matching hand-drafting practice
@@ -3985,9 +4561,21 @@ function draftOnce(
       // last resort.
       const vertTops = r.segs.filter((c) => sameCoord(c.x1, c.x2)).map((c) => ({ x: c.x1, y: Math.min(c.y1, c.y2) }));
       const candidates = [...vertTops.sort((a, b) => a.y - b.y || a.x - b.x), pts[0]!];
+      // a part is its body and its leads: the leads run from the body out to
+      // the pins' connection points, and a name anchored at a lead's end
+      // stood on it (VREF_RAW over R3's lower lead)
+      const withLeads = (pl: Placed): Bounds => {
+        const pts = pl.sym.pins.map((pin) => pinAt(pl, pin));
+        return {
+          minX: Math.min(pl.body.minX, ...pts.map((q) => q.x)),
+          minY: Math.min(pl.body.minY, ...pts.map((q) => q.y)),
+          maxX: Math.max(pl.body.maxX, ...pts.map((q) => q.x)),
+          maxY: Math.max(pl.body.maxY, ...pts.map((q) => q.y)),
+        };
+      };
       const clearOfBodies = (pt: { x: number; y: number }): boolean => {
         const b = labelTextBox(net.name, pt.x, pt.y, 0);
-        if ([...placed.values()].some((pl) => boundsOverlap(b, pl.body))) return false;
+        if ([...placed.values()].some((pl) => boundsOverlap(b, withLeads(pl)))) return false;
         return !labels.some((o) => o.name !== net.name && boundsOverlap(padBox(b), labelTextBox(o.name, o.x, o.y, o.rot)));
       };
       const at = candidates.find(clearOfBodies) ?? pts[0]!;
@@ -4020,7 +4608,28 @@ function draftOnce(
     // and labelled once: adjacency before labelling (#220 phase 3), so a part
     // hung on a pin or lying on its row is wired to it whatever the rest of
     // the net does. Lone endpoints keep a stub and a label.
-    const sorted: Stub[] = [...stubs].sort((a, b) => a.end.x - b.end.x || a.end.y - b.end.y);
+    // An op-amp's output tied to its own inverting input is its feedback,
+    // and a reader looks for it drawn around the amplifier: that pair is
+    // routed first (the loop shape), before any clustering, and the output
+    // stays in for the rest of the net. Clustered by distance, a follower's
+    // output joined the cap hung on it and its inverting input joined
+    // whatever sat on the other side (the preamp's mid-rail buffer ran pin 6
+    // across the bias divider to C5).
+    const fedBack = new Set<Stub>();
+    const inverting = (pin: DraftPin): boolean => /^(-|IN-|−)$/i.test(pin.name);
+    for (const o of stubs.filter((x) => x.ep.pin.etype === 'output')) {
+      const m = stubs.find((x) => x !== o && x.ep.ref === o.ep.ref && inverting(x.ep.pin) && !fedBack.has(x));
+      if (!m) continue;
+      const r = routeStubs([o, m]);
+      if (!r) continue;
+      trace(`route ${net.name}: ${o.ep.ref}.${o.ep.pin.number} fed back to ${m.ep.ref}.${m.ep.pin.number}`);
+      // the loop needs no name of its own: it is wired, and the output it
+      // hangs from carries the net's name wherever the net goes on (a
+      // second FILT label landed on the first)
+      commitRoute([o, m], r, stubs.length <= 2);
+      fedBack.add(m);
+    }
+    const sorted: Stub[] = stubs.filter((s) => !fedBack.has(s)).sort((a, b) => a.end.x - b.end.x || a.end.y - b.end.y);
     const clusters: Stub[][] = [];
     const anchorKey = (ref: string): string => {
       let k = ref;
@@ -4038,7 +4647,7 @@ function draftOnce(
       if (home) home.push(s);
       else clusters.push([s]);
     }
-    const wiredStubs = new Set<Stub>();
+    const wiredStubs = new Set<Stub>(fedBack);
     for (const found of clusters) {
       // A cluster past the wired-net size is a pin with its hung parts plus
       // whatever else sits within span: it is narrowed to the largest set of
@@ -4065,6 +4674,19 @@ function draftOnce(
           attempts++;
           const r = routeStubs(cur);
           if (!r) return;
+          // a net the placement search chose to label is not wired between
+          // parts that belong to different anchors (or to none): a hang, a
+          // bridge or a row keeps the wire to the pin it belongs to
+          if (labelNets.has(net.name) && new Set(cur.map((st) => anchorKey(st.ep.ref))).size > 1) return;
+          // Parts placed in columns (nothing hung on a pin) are wired only
+          // where the wire crosses no other net: a run that can only be drawn
+          // across another net's wire reads as a short, and labels say the
+          // same thing without one (the Sallen-Key's SK1 ran up R7 across its
+          // STAGE1 stub). A part hung on a pin keeps its wire.
+          if (!cur.some((st) => boundTo.has(st.ep.ref)) && crossingsOf(net.name, r.segs) > 0) {
+            trace(`route ${net.name}: ${cur.map((st) => `${st.ep.ref}.${st.ep.pin.number}`).join(', ')} would cross another net; not wired`);
+            return;
+          }
           const sub = [...cur];
           commitRoute(sub, r);
           for (const s of sub) wiredStubs.add(s);
@@ -4425,9 +5047,14 @@ function draftOnce(
       if (hitBody) return blocked(`the body of ${hitBody[0]} (${JSON.stringify(hitBody[1].body)})`);
       if (textObstacles.some((b) => boundsOverlap(padBox(box), b))) return blocked('field text');
       if (wires.some((w) => !attached(w) && segHitsBox(w, box))) return blocked('a wire');
-      return !labels.some(
-        (o, i) => i !== rec.label && o.name !== lb.name && boundsOverlap(padBox(box), labelTextBox(o.name, o.x, o.y, o.rot, o.kind)),
-      );
+      // flags on neighbouring pin rows stack edge to edge, the way a
+      // header's signals read down its pins; any other pair keeps the pad
+      return !labels.some((o, i) => {
+        if (i === rec.label || o.name === lb.name) return false;
+        const ob = labelTextBox(o.name, o.x, o.y, o.rot, o.kind);
+        const stack = lb.kind === 'global' && o.kind === 'global' && (rot === 0 || rot === 180) && (o.rot === 0 || o.rot === 180);
+        return boundsOverlap(stack ? box : padBox(box), ob);
+      });
     };
     if (clearWired(lb.x, lb.y, lb.rot)) continue;
     trace(`label ${lb.name}: (${lb.x}, ${lb.y}, ${lb.rot}) not clear, searching`);
@@ -4657,7 +5284,16 @@ function draftOnce(
     ]);
     const valueEntries = extraSymbols.filter((s) => !s.hideValue);
     const liveBoxes = new Map(valueEntries.map((s) => [s, powerValueBox(s.value, s.valueAt.x, s.valueAt.y)]));
+    // every power symbol's own glyph (arrow, bar or flag on its stem): a
+    // name placed clear of bodies and wires still sat on the neighbouring
+    // pin's GND bar (a jack's +12V under J1)
+    const glyphs = extraSymbols.map((ps) => {
+      const across = ps.at.rot % 180 === 0 ? U : 2 * U;
+      const along = ps.at.rot % 180 === 0 ? 2 * U : U;
+      return { ps, box: { minX: ps.at.x - across, minY: ps.at.y - along, maxX: ps.at.x + across, maxY: ps.at.y + along } };
+    });
     const clearFor = (self: EmitSymbol, b: Bounds): boolean =>
+      !glyphs.some((g) => g.ps !== self && boundsOverlap(b, g.box)) &&
       !bodies.some((bd) => boundsOverlap(b, bd)) &&
       !wires.some((w) => segHitsBoxEarly(w, b)) &&
       !labelBoxesFinal.some((lb) => boundsOverlap(lb, padBox(b))) &&
@@ -4956,9 +5592,45 @@ function draftOnce(
       const left0 = Math.min(...groupRects.map((r) => r.x1));
       const top0 = Math.min(...groupRects.map((r) => r.y1));
       const place = (r: (typeof groupRects)[number], x: number, y: number): void => moveGroup(r, snap(x - r.x1), snap(y - r.y1));
+      // The title-block corner as the sheet pass will see it once it centres
+      // the content on the paper: a box reaching into it cannot keep a
+      // stretched edge there.
+      const inCorner = (): ((r: { x2: number; y2: number }) => boolean) => {
+        const paper = fit.paper;
+        const xs = groupRects.flatMap((r) => [r.x1, r.x2]);
+        const ys = groupRects.flatMap((r) => [r.y1, r.y2]);
+        const dx = grid(Math.round((FRAME + Math.max(0, (paper.w - 2 * FRAME - (Math.max(...xs) - Math.min(...xs))) / 2) - Math.min(...xs)) / U));
+        const dy = grid(Math.round((FRAME + 4 * U + Math.max(0, (paper.h - 2 * FRAME - TITLE_STRIP - (Math.max(...ys) - Math.min(...ys))) / 2) - Math.min(...ys)) / U));
+        const cornerX = paper.w - FRAME - TITLE_BLOCK_W - dx;
+        const cornerY = paper.h - FRAME - TITLE_STRIP - dy;
+        return (r) => r.x2 > cornerX && r.y2 > cornerY;
+      };
+      // Every box then reaches for its cell of the layout, the way a flex or
+      // grid container stretches its items, as far as a latch: a row's boxes
+      // toward the row's height, a column's boxes toward its width, and the
+      // last box of a short line toward the layout's far edge. The content
+      // stays where the padding put it. A box whose stretched edge would
+      // reach into the title-block corner keeps its own size.
+      // Only a near edge is latched on to: a box short of its row's bottom
+      // or its column's width by a few units takes it, so edges that almost
+      // line up do; one far short keeps its own size (stretched all the way,
+      // a small group became a big box of empty tint beside a tall one).
+      const LATCH = 8 * U;
+      const stretch = (sizes: Map<(typeof groupRects)[number], { x2: number; y2: number }>): void => {
+        const own = new Map(groupRects.map((r) => [r, { x2: r.x2, y2: r.y2 }]));
+        for (const [r, to] of sizes) {
+          Object.assign(r, {
+            x2: to.x2 - r.x2 <= LATCH + 1e-6 ? to.x2 : r.x2,
+            y2: to.y2 - r.y2 <= LATCH + 1e-6 ? to.y2 : r.y2,
+          });
+        }
+        const hits = inCorner();
+        for (const r of groupRects) if (hits(r)) Object.assign(r, own.get(r)!);
+      };
       if (columnar) {
         // a column shares its left edge; its boxes stack at their own heights
         let x = left0;
+        const colW: number[] = [];
         for (const col of lines) {
           col.sort((a, b) => a.y1 - b.y1);
           let y = top0;
@@ -4966,20 +5638,34 @@ function draftOnce(
             place(r, x, y);
             y = r.y2 + lineGap;
           }
-          x += Math.max(...col.map((r) => r.x2 - r.x1)) + lineGap;
+          colW.push(Math.max(...col.map((r) => r.x2 - r.x1)));
+          x += colW[colW.length - 1]! + lineGap;
         }
+        const bottom = Math.max(...groupRects.map((r) => r.y2));
+        const sizes = new Map<(typeof groupRects)[number], { x2: number; y2: number }>();
+        lines.forEach((col, k) => col.forEach((r, i) => sizes.set(r, { x2: r.x1 + colW[k]!, y2: i === col.length - 1 ? bottom : r.y2 })));
+        stretch(sizes);
       } else {
         for (const row of lines) row.sort((a, b) => a.x1 - b.x1);
         const rowH = lines.map((row) => Math.max(...row.map((r) => r.y2 - r.y1)));
         const colW: number[] = [];
         for (const row of lines) row.forEach((r, j) => (colW[j] = Math.max(colW[j] ?? 0, r.x2 - r.x1)));
+        // The widest span grid-aligned boxes can take inside the frame: the
+        // first and last grid lines within it, not the frame itself (a row
+        // 0.14 mm inside A4's frame still ran 0.02 mm past it once its left
+        // edge landed on the first grid line in). A row wider than that
+        // closes its gaps, down to a unit, before it overruns the frame.
+        const span = grid(Math.floor((fit.paper.w - FRAME) / U + 1e-6)) - grid(Math.ceil(FRAME / U - 1e-6));
         const layOut = (asGrid: boolean): void => {
           let y = top0;
           lines.forEach((row, i) => {
+            const widths = row.map((r, j) => (asGrid ? colW[j]! : r.x2 - r.x1));
+            const room = span - widths.reduce((a, w) => a + w, 0);
+            const gap = row.length > 1 && room < lineGap * (row.length - 1) ? Math.max(U, grid(Math.floor(room / (row.length - 1) / U + 1e-6))) : lineGap;
             let x = left0;
             row.forEach((r, j) => {
               place(r, x, y);
-              x += (asGrid ? colW[j]! : r.x2 - r.x1) + lineGap;
+              x += widths[j]! + gap;
             });
             y += rowH[i]! + lineGap;
           });
@@ -4990,19 +5676,27 @@ function draftOnce(
         // corner once the sheet pass centres the content, each row packs its
         // own boxes instead and shares only its top.
         const gridW = colW.reduce((a, w) => a + w, 0) + lineGap * (colW.length - 1);
-        let asGrid = lines.length > 1 && gridW <= fit.paper.w - 2 * FRAME + 1e-6;
+        // and only when each column's boxes are near its width already: a
+        // column whose widest box is far wider than the rest opened a gap
+        // beside the narrow ones that no latch closes
+        const nearColumns = lines.every((row) => row.every((r, j) => colW[j]! - (r.x2 - r.x1) <= 8 * U + 1e-6));
+        let asGrid = lines.length > 1 && nearColumns && gridW <= fit.paper.w - 2 * FRAME + 1e-6;
         if (asGrid) {
           layOut(true);
-          const paper = fit.paper;
-          const xs = groupRects.flatMap((r) => [r.x1, r.x2]);
-          const ys = groupRects.flatMap((r) => [r.y1, r.y2]);
-          const dx = grid(Math.round((FRAME + Math.max(0, (paper.w - 2 * FRAME - (Math.max(...xs) - Math.min(...xs))) / 2) - Math.min(...xs)) / U));
-          const dy = grid(Math.round((FRAME + 4 * U + Math.max(0, (paper.h - 2 * FRAME - TITLE_STRIP - (Math.max(...ys) - Math.min(...ys))) / 2) - Math.min(...ys)) / U));
-          const cornerX = paper.w - FRAME - TITLE_BLOCK_W - dx;
-          const cornerY = paper.h - FRAME - TITLE_STRIP - dy;
-          if (groupRects.some((r) => r.x2 > cornerX && r.y2 > cornerY)) asGrid = false;
+          const hits = inCorner();
+          if (groupRects.some(hits)) asGrid = false;
         }
         if (!asGrid) layOut(false);
+        const right = Math.max(...groupRects.map((r) => r.x2));
+        const sizes = new Map<(typeof groupRects)[number], { x2: number; y2: number }>();
+        lines.forEach((row, i) =>
+          row.forEach((r, j) => {
+            const last = j === row.length - 1;
+            const x2 = last && lines.length > 1 ? right : asGrid ? r.x1 + colW[j]! : r.x2;
+            sizes.set(r, { x2, y2: r.y1 + rowH[i]! });
+          }),
+        );
+        stretch(sizes);
       }
     }
   }
@@ -5260,6 +5954,7 @@ function draftOnce(
     );
   }
 
+  const groupColors = groupColorsOf(groupRects.map((r) => r.name));
   const model: PlacementModel = {
     projectName,
     paper: paper.name,
@@ -5270,8 +5965,11 @@ function draftOnce(
     junctions: uniqJunctions,
     labels,
     noConnects,
-    rectangles: groupRects.map((r) => ({ x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, stroke: 'solid' as const, name: r.name })),
-    captions: groupRects.map((r) => ({ text: r.caption ?? r.name, x: r.x1 + 2, y: r.y1 + 2, name: r.name })),
+    // edges summed and shifted along the way carry float noise (111.76
+    // against 111.75999999999999); each is stated on its grid line, so boxes
+    // that share a top or a left edge share it exactly
+    rectangles: groupRects.map((r) => ({ x1: onGridLine(r.x1), y1: onGridLine(r.y1), x2: onGridLine(r.x2), y2: onGridLine(r.y2), stroke: 'dash' as const, color: groupColors[r.name], name: r.name })),
+    captions: groupRects.map((r) => ({ text: r.caption ?? r.name, x: r.x1 + 2, y: r.y1 + 2, color: groupColors[r.name], name: r.name })),
     netColors: netColorsOf(intent.nets, netClasses),
   };
 

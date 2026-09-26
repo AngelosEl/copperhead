@@ -813,30 +813,45 @@ describe('group boxes: tight, padded, on a sheet grid', () => {
     return intent;
   }
 
-  it('lays wrapped rows out as a grid: edges on the unit grid, shared tops and lefts, even gutters', async () => {
-    const { model } = await place(unevenRibbon(8));
-    // the groups really differ in width, so a shared left edge is the grid's doing
-    expect(new Set(model.rectangles.map((r) => Math.round((r.x2 - r.x1) / U))).size).toBeGreaterThan(1);
-    const rects = model.rectangles;
+  /** Wrapped rows: every edge on the unit grid, a row sharing its top, neighbours and rows a gutter apart. */
+  function expectRows(rects: { x1: number; y1: number; x2: number; y2: number; name?: string }[]) {
     for (const r of rects) {
       for (const v of [r.x1, r.y1, r.x2, r.y2]) expect(onGrid(v), `${r.name} edge ${v}`).toBe(true);
     }
     const rows = rowsOf(rects).map((names) => names.map((n) => rects.find((r) => r.name === n)!));
     expect(rows.length).toBeGreaterThanOrEqual(2);
     for (const row of rows) {
-      // a row shares its top; neighbours sit at least a gutter apart
       expect(new Set(row.map((r) => r.y1)).size).toBe(1);
       for (let j = 1; j < row.length; j++) expect(row[j]!.x1 - row[j - 1]!.x2).toBeGreaterThanOrEqual(4 * U - 1e-6);
     }
+    for (let i = 1; i < rows.length; i++) {
+      expect(Math.min(...rows[i]!.map((r) => r.y1)) - Math.max(...rows[i - 1]!.map((r) => r.y2))).toBeGreaterThanOrEqual(4 * U - 1e-6);
+    }
+    return rows;
+  }
+
+  it('packs each row on its own when a column would hold boxes far apart in width', async () => {
+    const { model } = await place(unevenRibbon(8));
+    // every other group carries a connector column, more than the latch wider
+    const widths = model.rectangles.map((r) => r.x2 - r.x1);
+    expect(Math.max(...widths) - Math.min(...widths)).toBeGreaterThan(8 * U);
+    const rows = expectRows(model.rectangles);
+    // a grid would have opened a gap beside every narrow box; the rows pack
+    // their own boxes instead, so some column's left edges differ
+    const cols = Math.max(...rows.map((r) => r.length));
+    const lefts = Array.from({ length: cols }, (_, j) => new Set(rows.filter((row) => row[j]).map((row) => row[j]!.x1)).size);
+    expect(Math.max(...lefts)).toBeGreaterThan(1);
+  });
+
+  it('lays wrapped rows out as a grid when every column is near its width: shared tops and lefts, even gutters', async () => {
+    const { model } = await place(ribbon(8));
+    const rects = model.rectangles;
+    const rows = expectRows(rects);
     // a column shares its left edge down the sheet
     const cols = Math.max(...rows.map((r) => r.length));
     for (let j = 0; j < cols; j++) {
       const lefts = rows.filter((row) => row[j]).map((row) => row[j]!.x1);
       expect(new Set(lefts).size, `column ${j}`).toBe(1);
-    }
-    // rows sit a gutter apart
-    for (let i = 1; i < rows.length; i++) {
-      expect(Math.min(...rows[i]!.map((r) => r.y1)) - Math.max(...rows[i - 1]!.map((r) => r.y2))).toBeGreaterThanOrEqual(4 * U - 1e-6);
     }
   });
 

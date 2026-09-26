@@ -275,10 +275,18 @@ function labelBounds(l: { name: string; x: number; y: number; rot: number; heigh
   // and nothing below it. Measuring it centred put half the box below the
   // wire the label sits on and called every label on a horizontal wire "text
   // on a wire" — the ordinary way a person names a wire.
+  // eeschema lifts the text off the wire by its label offset before it
+  // stands: measured on a plotted sheet the ink of a 1.27 mm label runs from
+  // 0.46 to 1.93 mm above its line, so the box reaches LOCAL_LABEL_RISE
+  // heights up (one height let XTAL1 print into the ISP_SCK flag on the pin
+  // row above and report clean)
+  const up = h * LOCAL_LABEL_RISE;
   return justified === 'right'
-    ? { minX: l.x - w, minY: l.y - h, maxX: l.x, maxY: l.y }
-    : { minX: l.x, minY: l.y - h, maxX: l.x + w, maxY: l.y };
+    ? { minX: l.x - w, minY: l.y - up, maxX: l.x, maxY: l.y }
+    : { minX: l.x, minY: l.y - up, maxX: l.x + w, maxY: l.y };
 }
+/** How far above its wire a plain label's text reaches, in text heights. */
+const LOCAL_LABEL_RISE = 1.54;
 
 /** Does the wire lie behind a flag's tip, along the direction the flag's text does NOT extend? */
 function onPoleSide(w: WireSeg, l: { x: number; y: number; rot: number }): boolean {
